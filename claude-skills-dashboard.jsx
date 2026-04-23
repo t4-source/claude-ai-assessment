@@ -604,11 +604,6 @@ function LoginPage({ setView, notify }) {
           {loading ? <span className="spinner" /> : "Sign In"}
         </button>
 
-        <div className="divider"><span>Firebase Auth</span></div>
-        <div className="auth-note">
-          Candidate accounts are created through signup. Admin accounts must be created in Firebase Auth and assigned <code>role: "admin"</code> in <code>users/&lt;uid&gt;</code>.
-        </div>
-
         <p className="auth-link">
           Don't have an account? <button onClick={() => setView("signup")}>Create one</button>
         </p>
@@ -616,17 +611,17 @@ function LoginPage({ setView, notify }) {
 
       <div className="auth-hero">
         <div className="hero-stats">
-          {[["847", "CAs Assessed"], ["94%", "Completion Rate"], ["4.8★", "Avg Rating"]].map(([val, lbl]) => (
+          {[["Role-Based", "CA Scenarios"], ["40 pts", "Structured Score"], ["AI + Excel", "Practical Workflow"]].map(([val, lbl]) => (
             <div key={lbl} className="hero-stat">
               <div className="hero-stat-val">{val}</div>
               <div className="hero-stat-lbl">{lbl}</div>
             </div>
           ))}
         </div>
-        <h2 className="hero-heading">Measure Your AI Advantage</h2>
-        <p className="hero-body">The industry's most comprehensive assessment of AI tool proficiency for Chartered Accountants. Benchmark yourself against peers, earn skill badges, and unlock career opportunities.</p>
+        <h2 className="hero-heading">Evaluate AI Readiness for Modern CA Work</h2>
+        <p className="hero-body">Assess how well candidates use AI for audit review, GST reconciliation, Excel-based analysis, report preparation, and professional quality control. The platform focuses on practical judgement, not generic prompt writing.</p>
         <div className="hero-tags">
-          {["Audit Analysis", "GST Review", "Excel Workflows", "Report Formatting", "AI Quality Control"].map(t => (
+          {["Audit Risk Review", "GST Reconciliation", "Excel and CSV Checks", "Working Paper Output", "AI Reliability Review"].map(t => (
             <span key={t} className="hero-tag">{t}</span>
           ))}
         </div>
