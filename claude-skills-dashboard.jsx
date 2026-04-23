@@ -1002,13 +1002,17 @@ function AssessmentPage({ db, currentUser, setView, notify, logout }) {
           {section === 1 && (
             <div>
               <div className="section-header">
-                <h3 className="section-title">Section B: Excel and File Workflow <span className="pts-badge">20 pts</span></h3>
-                <p className="section-desc">Show how you would use AI with Excel or CSV data in a real CA workflow. The answer should prove that you can give structured file instructions, validate formulas, and convert AI output into a usable schedule or report.</p>
+                <h3 className="section-title">Section B: Excel and File Workflow <span className="pts-badge">20 marks</span></h3>
+                <div className="section-desc">
+                  <p><strong>Scenario:</strong> You are given two files: 1. Sales Register (Excel) 2. GSTR-1 data (CSV).</p>
+                  <p><strong>Task:</strong> Explain how you would use an AI tool, such as Claude, along with Excel/CSV data to reconcile these records and identify mismatches.</p>
+                  <p><strong>Note:</strong> Focus on practical workflow. No coding required.</p>
+                </div>
               </div>
               {[
-                ["Prompt Used for Excel/CSV Analysis", "promptUsed", "Example: I have uploaded sales_register.xlsx and GSTR-1.csv. Reconcile invoice number, date, taxable value, GSTIN, and tax amount. Return mismatches as CSV-ready columns..."],
-                ["AI Output or Expected Output Format", "claudeOutput", "Paste the AI output, or specify the exact table/CSV structure it should return, including column names and validation checks."],
-                ["Your Validation and Improvements", "candidateImprovements", "Explain how you would verify formulas, totals, duplicate invoices, date formats, GSTIN validity, and whether the output is safe to use in a working paper."],
+                ["1. Prompt You Would Use", "promptUsed", "Write the exact prompt you would give to the AI to analyze the files. Include fields to compare such as invoice number, date, GSTIN, taxable value, and tax amount."],
+                ["2. Expected Output Format", "claudeOutput", "Describe or show how the AI should return results. Example: a table or CSV with columns like Invoice No, Issue Type, Difference Amount, and Remarks."],
+                ["3. Validation Steps and Final Deliverable", "candidateImprovements", "Explain how you would verify the AI output using Excel, such as formulas, filters, pivot tables, and cross-checking totals. Then explain how you would convert the AI output into a usable report for audit or GST reconciliation."],
               ].map(([lbl, key, ph]) => (
                 <div className="form-group" key={key}>
                   <label>{lbl}</label>
