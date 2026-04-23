@@ -854,8 +854,7 @@ function CandidateDashboard({ db, currentUser, setView, logout }) {
 function AssessmentPage({ db, currentUser, setView, notify, logout }) {
   const existing = db.responses.find(r => r.userId === currentUser.id);
   const [section, setSection] = useState(0);
-  const [timer, setTimer] = useState(45 * 60);
-  const [timerActive, setTimerActive] = useState(false);
+  const [timer, setTimer] = useState(30 * 60);
   const [answers, setAnswers] = useState(EMPTY_ANSWERS);
   const [saving, setSaving] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -897,12 +896,22 @@ function AssessmentPage({ db, currentUser, setView, notify, logout }) {
   }, [answers]);
 
   useEffect(() => {
-    if (!timerActive) return;
     const t = setInterval(() => setTimer(s => { if (s <= 1) { clearInterval(t); handleSubmit(); return 0; } return s - 1; }), 1000);
     return () => clearInterval(t);
-  }, [timerActive]);
+  }, []);
 
   const set = k => e => setAnswers(a => ({ ...a, [k]: e.target.value }));
+  const blockPaste = e => {
+    e.preventDefault();
+    notify("Pasting is disabled during the assessment.", "error");
+  };
+  const textareaSecurityProps = {
+    onPaste: blockPaste,
+    onDrop: blockPaste,
+    onContextMenu: e => e.preventDefault(),
+    autoComplete: "off",
+    spellCheck: false,
+  };
   const fmt = s => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
 
   const handleSubmit = async () => {
@@ -970,11 +979,7 @@ function AssessmentPage({ db, currentUser, setView, notify, logout }) {
             <p className="page-sub">Section {section + 1} of 5 • {saving ? "Autosaving…" : "All changes saved"}</p>
           </div>
           <div className="assessment-controls">
-            {timerActive ? (
-              <div className={`timer ${timer < 300 ? "timer-urgent" : ""}`}>⏱ {fmt(timer)}</div>
-            ) : (
-              <button className="btn-outline sm" onClick={() => setTimerActive(true)}>Start Timer</button>
-            )}
+            <div className={`timer ${timer < 300 ? "timer-urgent" : ""}`}>⏱ {fmt(timer)}</div>
           </div>
         </div>
 
@@ -995,6 +1000,7 @@ function AssessmentPage({ db, currentUser, setView, notify, logout }) {
               title="Section A: Audit Prompt Design" score="10 pts"
               desc="Write one professional prompt for an AI assistant to review a client's trial balance and financial statements for audit risk. The prompt must define the CA role, required documents, materiality threshold, checks to perform, and the exact output format expected for audit working papers."
               field="sectionA" val={answers.sectionA} set={set("sectionA")}
+              textareaProps={textareaSecurityProps}
               placeholder="Act as an Indian statutory audit manager. Review the attached trial balance, ledger extract, and financial statements. Check revenue cut-off, unusual journals, related parties, GST/TDS exposures, ageing, material variances... Return a table with Issue | Evidence | Amount | Risk | Audit Procedure | Client Query."
               minLen={450}
             />
@@ -1017,7 +1023,7 @@ function AssessmentPage({ db, currentUser, setView, notify, logout }) {
                 <div className="form-group" key={key}>
                   <label>{lbl}</label>
                   <textarea className="form-textarea" rows={6} value={answers[key]}
-                    onChange={set(key)} placeholder={ph} />
+                    onChange={set(key)} placeholder={ph} {...textareaSecurityProps} />
                 </div>
               ))}
             </div>
@@ -1027,6 +1033,7 @@ function AssessmentPage({ db, currentUser, setView, notify, logout }) {
               title="Section C: Review AI Output Quality" score="10 pts"
               desc={<>Review the AI output below as if you are signing off a working paper. Identify what is wrong, what evidence is missing, and what follow-up instructions you would give before relying on it.<br /><br /><div className="sample-output">"Sales increased by 18% and expenses look normal. GST seems mostly fine. A few invoices may need checking. Overall, there is no major issue, but the client should confirm the numbers."</div></>}
               field="sectionC" val={answers.sectionC} set={set("sectionC")}
+              textareaProps={textareaSecurityProps}
               placeholder="This output is not sufficient because it does not cite source files, invoice IDs, materiality, exception amounts, formulas used, or audit procedures. I would ask the AI to..."
               minLen={350}
             />
@@ -1044,7 +1051,8 @@ function AssessmentPage({ db, currentUser, setView, notify, logout }) {
                 <label>Your Improved Prompt</label>
                 <textarea className="form-textarea" rows={8} value={answers.sectionD}
                   onChange={set("sectionD")}
-                  placeholder="Act as a GST reconciliation specialist. Use sales_register.xlsx, GSTR-1.csv, and GSTR-3B.pdf. Match by GSTIN, invoice number, date, taxable value, CGST/SGST/IGST. Flag mismatches above Rs 5,000 or 2%, duplicates, missing invoices, invalid GSTINs, and date-format issues. Return a table plus a CSV-ready exception list..." />
+                  placeholder="Act as a GST reconciliation specialist. Use sales_register.xlsx, GSTR-1.csv, and GSTR-3B.pdf. Match by GSTIN, invoice number, date, taxable value, CGST/SGST/IGST. Flag mismatches above Rs 5,000 or 2%, duplicates, missing invoices, invalid GSTINs, and date-format issues. Return a table plus a CSV-ready exception list..."
+                  {...textareaSecurityProps} />
               </div>
             </div>
           )}
@@ -1053,6 +1061,7 @@ function AssessmentPage({ db, currentUser, setView, notify, logout }) {
               title="Section E: Client Deliverable Prompt" score="Synthesis"
               desc="Your client is a manufacturing company with Rs 12Cr turnover. Write a prompt that makes AI produce a client-ready GST and audit deliverable. It should include a checklist, Excel-ready reconciliation table, source-document assumptions, and a short management summary."
               field="sectionE" val={answers.sectionE} set={set("sectionE")}
+              textareaProps={textareaSecurityProps}
               placeholder="Prepare a professional deliverable for a manufacturing client. Inputs: purchase register, sales register, GSTR-1, GSTR-3B, E-way bill data, fixed asset additions, and previous-year audit points. Output: management summary, compliance checklist, Excel-ready exception table, responsible owner, due date, risk rating, and evidence required."
               minLen={500}
             />
@@ -1080,7 +1089,7 @@ function AssessmentPage({ db, currentUser, setView, notify, logout }) {
   );
 }
 
-function AssessmentSection({ title, score, desc, field, val, set, placeholder, minLen }) {
+function AssessmentSection({ title, score, desc, field, val, set, placeholder, minLen, textareaProps = {} }) {
   const pct = Math.min(100, Math.round((val.length / minLen) * 100));
   return (
     <div>
@@ -1090,7 +1099,7 @@ function AssessmentSection({ title, score, desc, field, val, set, placeholder, m
       </div>
       <div className="form-group">
         <label>Your Response</label>
-        <textarea className="form-textarea" rows={9} value={val} onChange={set} placeholder={placeholder} />
+        <textarea className="form-textarea" rows={9} value={val} onChange={set} placeholder={placeholder} {...textareaProps} />
         <div className="char-indicator">
           <div className="char-bar" style={{ width: `${pct}%`, background: pct >= 100 ? "#22c55e" : "#f59e0b" }} />
         </div>
