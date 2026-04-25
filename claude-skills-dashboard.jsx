@@ -1167,8 +1167,15 @@ function DailyTasksPage({ db, currentUser, setView, logout, notify }) {
               ) : (
                 <>
                   <div className="card">
-                    <h3 className="card-title">{selectedTask.title}</h3>
-                    <div className="muted" style={{ marginBottom: 10 }}>Deadline: {selectedTask.deadline ? new Date(selectedTask.deadline).toLocaleString() : "N/A"}</div>
+                    <div className="task-detail-head">
+                      <div>
+                        <h3 className="task-detail-title">{selectedTask.title}</h3>
+                        <div className="task-detail-sub">Deadline: {selectedTask.deadline ? new Date(selectedTask.deadline).toLocaleString() : "N/A"}</div>
+                      </div>
+                      <div className={`task-status ${mySubmission ? "submitted" : isLate ? "expired" : "open"}`}>
+                        {mySubmission ? "Submitted" : isLate ? "Expired" : "Open"}
+                      </div>
+                    </div>
                     <div className="task-full-desc">{selectedTask.description}</div>
                   </div>
 
@@ -1807,7 +1814,7 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
 
             <div className="card">
               <h3 className="card-title">Create Daily Task</h3>
-              <div className="two-col" style={{ gridTemplateColumns: "1.1fr 0.9fr" }}>
+              <div className="task-create-grid">
                 <div>
                   <div className="form-group">
                     <label>Title</label>
@@ -1833,7 +1840,7 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
                   <div className="form-group">
                     <label>Deadline</label>
                     <input
-                      className="form-input"
+                      className="form-input datetime-input"
                       type="datetime-local"
                       value={taskForm.deadline}
                       onChange={e => setTaskForm(f => ({ ...f, deadline: e.target.value }))}
@@ -2408,7 +2415,7 @@ function CSS() {
     .form-group label { font-size: 13px; font-weight: 800; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
     .form-input { background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; color: var(--text); font-size: 16px; font-family: 'Source Sans 3', sans-serif; transition: border .2s, box-shadow .2s; outline: none; }
     .form-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(23,59,99,0.12); }
-    .form-textarea { background: #fff; border: 1px solid var(--border-strong); border-radius: 8px; padding: 18px; color: var(--text); font-size: 17px; font-family: 'Source Sans 3', sans-serif; resize: vertical; outline: none; transition: border .2s, box-shadow .2s; line-height: 1.65; min-height: 180px; }
+    .form-textarea { background: #fff; border: 1px solid var(--border-strong); border-radius: 10px; padding: 18px; color: var(--text); font-size: 17px; font-family: 'Source Sans 3', sans-serif; resize: vertical; outline: none; transition: border .2s, box-shadow .2s; line-height: 1.65; min-height: 180px; width: 100%; }
     .form-textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(23,59,99,0.12); }
     .form-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
 
@@ -2592,9 +2599,9 @@ function CSS() {
     .empty-chart { color: var(--muted); font-size: 13px; text-align: center; padding: 40px; }
 
     /* Daily Tasks */
-    .daily-tasks-page .page-title { font-size: 32px; letter-spacing: -0.02em; }
-    .daily-tasks-page .page-sub { font-size: 15px; }
-    .tasks-layout { display: grid; grid-template-columns: 420px 1fr; gap: 18px; align-items: start; }
+    .daily-tasks-page .page-title { font-size: 34px; letter-spacing: -0.03em; }
+    .daily-tasks-page .page-sub { font-size: 15px; max-width: 720px; }
+    .tasks-layout { display: grid; grid-template-columns: 420px 1fr; gap: 22px; align-items: start; }
     .task-list { display: flex; flex-direction: column; gap: 12px; }
     .task-card { width: 100%; text-align: left; background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 16px; cursor: pointer; transition: 0.15s; box-shadow: 0 10px 24px rgba(20, 32, 51, 0.06); }
     .task-card:hover { transform: translateY(-1px); border-color: rgba(35, 88, 187, 0.35); }
@@ -2607,12 +2614,15 @@ function CSS() {
     .task-status.open { background: #ecfdf5; border-color: rgba(34, 197, 94, 0.28); color: #166534; }
     .task-status.submitted { background: #eff6ff; border-color: rgba(37, 99, 235, 0.25); color: #1d4ed8; }
     .task-status.expired { background: #fff7ed; border-color: rgba(251, 146, 60, 0.35); color: #9a3412; }
-    .task-detail { display: flex; flex-direction: column; gap: 14px; }
+    .task-detail { display: flex; flex-direction: column; gap: 16px; }
     .task-detail .card { border-radius: 16px; padding: 26px 28px; }
+    .task-detail-head { display: flex; align-items: start; justify-content: space-between; gap: 14px; margin-bottom: 12px; }
+    .task-detail-title { font-size: 18px; font-weight: 900; letter-spacing: -0.01em; margin: 0; }
+    .task-detail-sub { color: var(--muted); font-size: 12px; font-family: 'IBM Plex Mono', monospace; margin-top: 6px; }
     .task-full-desc { color: var(--text); line-height: 1.7; font-size: 14px; white-space: pre-wrap; }
     .task-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; }
 
-    .task-answer { min-height: 280px; font-size: 16px; padding: 16px; }
+    .task-answer { min-height: 360px; font-size: 16px; padding: 18px; width: 100%; }
     .task-answer:disabled { background: #f8fafc; }
 
     .task-leaderboard { display: flex; flex-direction: column; gap: 6px; }
@@ -2634,8 +2644,13 @@ function CSS() {
     .task-status-pill.expired { background: #fff7ed; border-color: rgba(251, 146, 60, 0.28); color: #9a3412; }
     .task-status-pill.inactive { background: #f1f5f9; border-color: rgba(148, 163, 184, 0.45); color: #475569; }
 
+    .task-create-grid { display: grid; grid-template-columns: 1fr 360px; gap: 16px; align-items: start; }
+    .datetime-input { appearance: none; -webkit-appearance: none; padding-right: 42px; background-image: linear-gradient(transparent, transparent), url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20' viewBox='0 0 24 24' fill='none' stroke='%2366758a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3' y='4' width='18' height='18' rx='2' ry='2'/%3E%3Cline x1='16' y1='2' x2='16' y2='6'/%3E%3Cline x1='8' y1='2' x2='8' y2='6'/%3E%3Cline x1='3' y1='10' x2='21' y2='10'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 12px center; background-size: 18px; }
+    .datetime-input::-webkit-calendar-picker-indicator { opacity: 0; display: block; width: 36px; height: 36px; cursor: pointer; }
+
     @media (max-width: 1100px) {
       .tasks-layout { grid-template-columns: 1fr; }
+      .task-create-grid { grid-template-columns: 1fr; }
       .task-lb-head, .task-lb-row { grid-template-columns: 70px 1.6fr 120px 90px; }
       .task-admin-head, .task-admin-row { grid-template-columns: 1.4fr 1fr 0.7fr 0.5fr 0.7fr; }
     }
