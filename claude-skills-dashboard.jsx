@@ -652,13 +652,16 @@ function App() {
       ? query(collection(firestore, "task_submissions"), orderBy("submittedAt", "desc"))
       : query(
         collection(firestore, "task_submissions"),
-        where("userId", "==", currentUser.id),
-        orderBy("submittedAt", "desc")
+        where("userId", "==", currentUser.id)
       );
 
     const unsubscribeTaskSubmissions = onSnapshot(
       submissionsQuery,
-      snapshot => setTaskSubmissions(snapshot.docs.map(subDoc => normalizeTaskSubmission(subDoc.id, subDoc.data()))),
+      snapshot => {
+        const rows = snapshot.docs.map(subDoc => normalizeTaskSubmission(subDoc.id, subDoc.data()));
+        rows.sort((a, b) => (b.submittedAt || "").localeCompare(a.submittedAt || ""));
+        setTaskSubmissions(rows);
+      },
       error => notify(`Could not load task submissions: ${error.message}`, "error")
     );
 
