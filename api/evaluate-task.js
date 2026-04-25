@@ -3,12 +3,25 @@ import { getAuth } from "firebase-admin/auth";
 import { FieldValue, getFirestore } from "firebase-admin/firestore";
 import { initializeApp, getApps, cert } from "firebase-admin/app";
 
+function cleanEnv(value) {
+  if (value === undefined || value === null) return null;
+  const str = String(value).trim();
+  if (!str) return null;
+  if (str === "undefined" || str === "null") return null;
+  if ((str.startsWith('"') && str.endsWith('"')) || (str.startsWith("'") && str.endsWith("'"))) {
+    const inner = str.slice(1, -1).trim();
+    if (!inner || inner === "undefined" || inner === "null") return null;
+    return inner;
+  }
+  return str;
+}
+
 function ensureFirebaseAdminInit() {
   if (getApps().length) return;
 
-  const projectId = process.env.FIREBASE_PROJECT_ID;
-  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
-  const privateKeyRaw = process.env.FIREBASE_PRIVATE_KEY;
+  const projectId = cleanEnv(process.env.FIREBASE_PROJECT_ID) || cleanEnv(process.env.GOOGLE_CLOUD_PROJECT) || cleanEnv(process.env.GCLOUD_PROJECT);
+  const clientEmail = cleanEnv(process.env.FIREBASE_CLIENT_EMAIL);
+  const privateKeyRaw = cleanEnv(process.env.FIREBASE_PRIVATE_KEY);
   const privateKey = privateKeyRaw?.replace(/\\n/g, "\n");
 
   const missing = [
