@@ -549,18 +549,24 @@ async function evaluateDailyTaskWithAI({ taskId, answers }) {
     body: JSON.stringify({ taskId, answers }),
   });
 
+  const rawText = await response.text();
+
   if (!response.ok) {
     let message = "Could not submit task.";
     try {
-      const payload = await response.json();
+      const payload = rawText ? JSON.parse(rawText) : null;
       message = payload?.error || message;
     } catch {
-      message = await response.text();
+      message = rawText || message;
     }
     throw new Error(message);
   }
 
-  return response.json();
+  try {
+    return rawText ? JSON.parse(rawText) : {};
+  } catch {
+    return {};
+  }
 }
 
 // ─── App State ────────────────────────────────────────────────────────────
