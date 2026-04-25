@@ -3,12 +3,31 @@ import { getAuth } from "firebase-admin/auth";
 import { FieldValue, getFirestore } from "firebase-admin/firestore";
 import { initializeApp, getApps, cert } from "firebase-admin/app";
 
-if (!getApps().length) {
+function ensureFirebaseAdminInit() {
+  if (getApps().length) return;
+
+  const projectId = process.env.FIREBASE_PROJECT_ID;
+  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+  const privateKeyRaw = process.env.FIREBASE_PRIVATE_KEY;
+  const privateKey = privateKeyRaw?.replace(/\\n/g, "\n");
+
+  const missing = [
+    !projectId && "FIREBASE_PROJECT_ID",
+    !clientEmail && "FIREBASE_CLIENT_EMAIL",
+    !privateKey && "FIREBASE_PRIVATE_KEY",
+  ].filter(Boolean);
+
+  if (missing.length) {
+    const err = new Error(`Missing Firebase Admin env vars: ${missing.join(", ")}`);
+    err.code = "FIREBASE_ADMIN_ENV_MISSING";
+    throw err;
+  }
+
   initializeApp({
     credential: cert({
-      projectId: process.env.FIREBASE_PROJECT_ID,
-      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n"),
+      projectId,
+      clientEmail,
+      privateKey,
     }),
   });
 }
@@ -157,168 +176,178 @@ Feedback must be short and actionable (bullets). Flags are optional warnings lik
 `;
 
 export default async function handler(req, res) {
-  if (!assertJsonRequest(req, res)) return;
-
-  const token = getBearerToken(req);
-  if (!token) return res.status(401).json({ error: "Missing or malformed Authorization header" });
-
-  let decoded;
   try {
-    decoded = await getAuth().verifyIdToken(token);
-  } catch {
-    return res.status(403).json({ error: "Invalid or expired Firebase ID token" });
-  }
+    if (!assertJsonRequest(req, res)) return;
 
-  const { taskId, answers } = req.body ?? {};
-  if (!taskId || typeof taskId !== "string") {
-    return res.status(400).json({ error: "Missing taskId" });
-  }
-  if (!answers || typeof answers !== "string") {
-    return res.status(400).json({ error: "Missing answers" });
-  }
+    ensureFirebaseAdminInit();
 
-  const db = getFirestore();
-  const uid = decoded.uid;
+    const token = getBearerToken(req);
+    if (!token) return res.status(401).json({ error: "Missing or malformed Authorization header" });
 
-  const taskRef = db.collection("tasks").doc(taskId);
-  const taskSnap = await taskRef.get();
-  if (!taskSnap.exists) return res.status(404).json({ error: "Task not found" });
-
-  const task = taskSnap.data() || {};
-  if (!task.active) return res.status(409).json({ error: "Task is not active" });
-
-  const deadline = coerceDate(task.deadline);
-  if (!deadline) return res.status(400).json({ error: "Task deadline is invalid" });
-  if (Date.now() > deadline.getTime()) return res.status(409).json({ error: "Task deadline has passed" });
-
-  const existingQuery = await db
-    .collection("task_submissions")
-    .where("taskId", "==", taskId)
-    .where("userId", "==", uid)
-    .limit(1)
-    .get();
-
-  if (!existingQuery.empty) return res.status(409).json({ error: "You have already submitted for this task" });
-
-  let evaluation;
-  let evaluationSource = "openai";
-  let fallbackReason = null;
-
-  if (!process.env.OPENAI_API_KEY) {
-    evaluation = heuristicEvaluateTask({ taskTitle: task.title, taskDescription: task.description, answer: answers });
-    evaluationSource = "openai_key_missing_fallback";
-    fallbackReason = "OPENAI_API_KEY is not configured";
-  } else {
+    let decoded;
     try {
-      const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-      const response = await openai.chat.completions.create({
-        model: process.env.OPENAI_EVAL_MODEL || "gpt-4o-mini",
-        response_format: {
-          type: "json_schema",
-          json_schema: {
-            name: "task_evaluation",
-            strict: true,
-            schema: TASK_EVALUATION_SCHEMA,
-          },
-        },
-        messages: [
-          { role: "system", content: `${TASK_RUBRIC}\nReturn only JSON that matches the supplied schema.` },
-          {
-            role: "user",
-            content: JSON.stringify({
-              task: { id: taskId, title: task.title || "", description: task.description || "", deadline: deadline.toISOString() },
-              candidate: { uid },
-              answer: answers,
-            }),
-          },
-        ],
-      });
+      decoded = await getAuth().verifyIdToken(token);
+    } catch {
+      return res.status(403).json({ error: "Invalid or expired Firebase ID token" });
+    }
 
-      const raw = response.choices[0]?.message?.content;
-      if (!raw) throw new Error("OpenAI returned no output");
-      evaluation = normalizeEvaluation(JSON.parse(raw));
-    } catch (error) {
-      console.error("Task AI evaluation failed", error);
+    const { taskId, answers } = req.body ?? {};
+    if (!taskId || typeof taskId !== "string") {
+      return res.status(400).json({ error: "Missing taskId" });
+    }
+    if (!answers || typeof answers !== "string") {
+      return res.status(400).json({ error: "Missing answers" });
+    }
+
+    const db = getFirestore();
+    const uid = decoded.uid;
+
+    const taskRef = db.collection("tasks").doc(taskId);
+    const taskSnap = await taskRef.get();
+    if (!taskSnap.exists) return res.status(404).json({ error: "Task not found" });
+
+    const task = taskSnap.data() || {};
+    if (!task.active) return res.status(409).json({ error: "Task is not active" });
+
+    const deadline = coerceDate(task.deadline);
+    if (!deadline) return res.status(400).json({ error: "Task deadline is invalid" });
+    if (Date.now() > deadline.getTime()) return res.status(409).json({ error: "Task deadline has passed" });
+
+    const existingQuery = await db
+      .collection("task_submissions")
+      .where("taskId", "==", taskId)
+      .where("userId", "==", uid)
+      .limit(1)
+      .get();
+
+    if (!existingQuery.empty) return res.status(409).json({ error: "You have already submitted for this task" });
+
+    let evaluation;
+    let evaluationSource = "openai";
+    let fallbackReason = null;
+
+    if (!process.env.OPENAI_API_KEY) {
       evaluation = heuristicEvaluateTask({ taskTitle: task.title, taskDescription: task.description, answer: answers });
-      evaluationSource = "openai_error_fallback";
-      fallbackReason = error?.message || "OpenAI request failed";
+      evaluationSource = "openai_key_missing_fallback";
+      fallbackReason = "OPENAI_API_KEY is not configured";
+    } else {
+      try {
+        const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+        const response = await openai.chat.completions.create({
+          model: process.env.OPENAI_EVAL_MODEL || "gpt-4o-mini",
+          response_format: {
+            type: "json_schema",
+            json_schema: {
+              name: "task_evaluation",
+              strict: true,
+              schema: TASK_EVALUATION_SCHEMA,
+            },
+          },
+          messages: [
+            { role: "system", content: `${TASK_RUBRIC}\nReturn only JSON that matches the supplied schema.` },
+            {
+              role: "user",
+              content: JSON.stringify({
+                task: { id: taskId, title: task.title || "", description: task.description || "", deadline: deadline.toISOString() },
+                candidate: { uid },
+                answer: answers,
+              }),
+            },
+          ],
+        });
+
+        const raw = response.choices[0]?.message?.content;
+        if (!raw) throw new Error("OpenAI returned no output");
+        evaluation = normalizeEvaluation(JSON.parse(raw));
+      } catch (error) {
+        console.error("Task AI evaluation failed", error);
+        evaluation = heuristicEvaluateTask({ taskTitle: task.title, taskDescription: task.description, answer: answers });
+        evaluationSource = "openai_error_fallback";
+        fallbackReason = error?.message || "OpenAI request failed";
+      }
     }
-  }
 
-  const userSnap = await db.collection("users").doc(uid).get();
-  const userProfile = userSnap.exists ? userSnap.data() : {};
-  const candidateName = userProfile?.name || decoded.name || decoded.email?.split("@")[0] || "Candidate";
+    const userSnap = await db.collection("users").doc(uid).get();
+    const userProfile = userSnap.exists ? userSnap.data() : {};
+    const candidateName = userProfile?.name || decoded.name || decoded.email?.split("@")[0] || "Candidate";
 
-  const submissionRef = db.collection("task_submissions").doc();
-  const leaderboardRef = db.collection("task_leaderboards").doc(taskId).collection("entries").doc(uid);
+    const submissionRef = db.collection("task_submissions").doc();
+    const leaderboardRef = db.collection("task_leaderboards").doc(taskId).collection("entries").doc(uid);
 
-  const now = new Date();
+    const now = new Date();
 
-  await db.runTransaction(async tx => {
-    const existing = await tx.get(
-      db
-        .collection("task_submissions")
-        .where("taskId", "==", taskId)
-        .where("userId", "==", uid)
-        .limit(1)
-    );
+    await db.runTransaction(async tx => {
+      const existing = await tx.get(
+        db
+          .collection("task_submissions")
+          .where("taskId", "==", taskId)
+          .where("userId", "==", uid)
+          .limit(1)
+      );
 
-    if (!existing.empty) {
-      const err = new Error("duplicate");
-      err.code = "DUP";
-      throw err;
-    }
+      if (!existing.empty) {
+        const err = new Error("duplicate");
+        err.code = "DUP";
+        throw err;
+      }
 
-    tx.set(submissionRef, {
-      taskId,
-      userId: uid,
-      answers,
-      scores: evaluation.scores,
-      totalScore: evaluation.totalScore,
-      skillLevel: evaluation.skillLevel,
-      flags: evaluation.flags,
-      feedback: evaluation.feedback,
-      evaluationSource,
-      submittedAt: now,
-      createdAt: now,
-    });
-
-    tx.set(
-      taskRef,
-      {
-        submissionCount: FieldValue.increment(1),
-        lastSubmissionAt: now,
-      },
-      { merge: true }
-    );
-
-    tx.set(
-      leaderboardRef,
-      {
+      tx.set(submissionRef, {
         taskId,
         userId: uid,
-        candidateName,
+        answers,
+        scores: evaluation.scores,
         totalScore: evaluation.totalScore,
         skillLevel: evaluation.skillLevel,
+        flags: evaluation.flags,
+        feedback: evaluation.feedback,
+        evaluationSource,
         submittedAt: now,
-      },
-      { merge: true }
-    );
+        createdAt: now,
+      });
 
-    tx.set(
-      db.collection("task_leaderboards").doc(taskId),
-      {
-        taskId,
-        updatedAt: now,
-        title: task.title || "",
-      },
-      { merge: true }
-    );
-  });
+      tx.set(
+        taskRef,
+        {
+          submissionCount: FieldValue.increment(1),
+          lastSubmissionAt: now,
+        },
+        { merge: true }
+      );
 
-  return res.status(200).json({
-    ...evaluation,
-    source: evaluationSource,
-    ...(fallbackReason ? { fallbackReason } : {}),
-  });
+      tx.set(
+        leaderboardRef,
+        {
+          taskId,
+          userId: uid,
+          candidateName,
+          totalScore: evaluation.totalScore,
+          skillLevel: evaluation.skillLevel,
+          submittedAt: now,
+        },
+        { merge: true }
+      );
+
+      tx.set(
+        db.collection("task_leaderboards").doc(taskId),
+        {
+          taskId,
+          updatedAt: now,
+          title: task.title || "",
+        },
+        { merge: true }
+      );
+    });
+
+    return res.status(200).json({
+      ...evaluation,
+      source: evaluationSource,
+      ...(fallbackReason ? { fallbackReason } : {}),
+    });
+  } catch (error) {
+    console.error("/api/evaluate-task failed", error);
+    if (res.headersSent) return;
+    const message = error?.message || "Server error";
+    const status = error?.code === "FIREBASE_ADMIN_ENV_MISSING" ? 500 : 500;
+    return res.status(status).json({ error: message });
+  }
 }
