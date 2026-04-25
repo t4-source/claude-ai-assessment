@@ -1757,6 +1757,8 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
   const [taskSubmissionModal, setTaskSubmissionModal] = useState(null);
   const [taskManualScoreModal, setTaskManualScoreModal] = useState(null);
 
+  const [adminTaskLeaderboardTaskId, setAdminTaskLeaderboardTaskId] = useState("");
+
   const responses = db.responses;
   const candidates = db.users.filter(u => u.role === "candidate");
   const avgScore = responses.length ? Math.round(responses.reduce((a, r) => a + r.totalScore, 0) / responses.length) : 0;
@@ -1926,6 +1928,49 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
               <h3 className="card-title">Score Distribution</h3>
               <Histogram data={responses.map(r => r.totalScore)} />
             </div>
+          </>
+        )}
+
+        {tab === "task_leaderboards" && (
+          <>
+            <div className="page-header">
+              <div>
+                <h2 className="page-title">Task Leaderboards</h2>
+                <p className="page-sub">View per-task rankings for Daily Tasks.</p>
+              </div>
+              <div className="header-badge">Admin</div>
+            </div>
+
+            {!db.tasks.length ? (
+              <div className="empty-state">
+                <div className="empty-icon">🏆</div>
+                <h3>No tasks yet</h3>
+                <p>Create a Daily Task to start collecting submissions.</p>
+              </div>
+            ) : (
+              <div className="card">
+                <h3 className="card-title">Select Task</h3>
+                <div className="filter-bar" style={{ marginBottom: 0 }}>
+                  <select
+                    className="filter-select"
+                    value={adminTaskLeaderboardTaskId || ""}
+                    onChange={e => setAdminTaskLeaderboardTaskId(e.target.value)}
+                  >
+                    <option value="">Pick a task…</option>
+                    {db.tasks
+                      .slice()
+                      .sort((a, b) => (b.deadline || "").localeCompare(a.deadline || ""))
+                      .map(t => (
+                        <option key={t.id} value={t.id}>{t.title}</option>
+                      ))}
+                  </select>
+                </div>
+              </div>
+            )}
+
+            {adminTaskLeaderboardTaskId && (
+              <TaskLeaderboard taskId={adminTaskLeaderboardTaskId} currentUser={currentUser} />
+            )}
           </>
         )}
 
@@ -2337,7 +2382,8 @@ function Sidebar({ role, current, setView, logout, user }) {
   const adminLinks = [
     { id: "overview", label: "Overview", icon: "⊞" },
     { id: "candidates", label: "Candidates", icon: "👥" },
-    { id: "leaderboard", label: "Leaderboard", icon: "🏆" },
+    { id: "leaderboard", label: "Assessment Leaderboard", icon: "🏆" },
+    { id: "task_leaderboards", label: "Task Leaderboards", icon: "📋" },
     { id: "tasks", label: "Daily Tasks", icon: "🗓" },
   ];
   const links = role === "admin" ? adminLinks : candidateLinks;
