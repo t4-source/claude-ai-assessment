@@ -16,6 +16,7 @@ import {
   onSnapshot,
   orderBy,
   query,
+  where,
   serverTimestamp,
   setDoc,
   updateDoc,
@@ -56,6 +57,151 @@ function getIsoDate(value) {
   if (typeof value === "string") return value;
   if (typeof value.toDate === "function") return value.toDate().toISOString();
   return "";
+}
+
+function TaskSubmissionsViewer({ task, db, onClose, onOpenSubmission }) {
+  const submissions = db.taskSubmissions
+    .filter(s => s.taskId === task.id)
+    .slice()
+    .sort((a, b) => b.totalScore - a.totalScore);
+
+  const topTenCount = submissions.length ? Math.max(1, Math.ceil(submissions.length * 0.1)) : 0;
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal modal-wide" onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <div>
+            <h3>{task.title}</h3>
+            <div className="modal-sub">{submissions.length} submissions • Ranked by score</div>
+          </div>
+          <button className="close-btn" onClick={onClose}>✕</button>
+        </div>
+        <div className="modal-body scrollable">
+          <div className="answer-item">
+            <div className="answer-label">Task Description</div>
+            <div className="answer-text">{task.description}</div>
+          </div>
+
+          {!submissions.length ? (
+            <div className="empty-chart">No submissions yet</div>
+          ) : (
+            <div className="task-admin-table" style={{ marginTop: 12 }}>
+              <div className="task-admin-head" style={{ gridTemplateColumns: "0.6fr 1.6fr 0.7fr 0.5fr 0.6fr" }}>
+                <div>Rank</div>
+                <div>Candidate</div>
+                <div>Skill</div>
+                <div style={{ textAlign: "right" }}>Score</div>
+                <div style={{ textAlign: "right" }}>Open</div>
+              </div>
+              {submissions.map((s, i) => {
+                const user = db.users.find(u => u.id === s.userId);
+                const isTopTen = i < topTenCount;
+                return (
+                  <div
+                    key={s.id}
+                    className="task-admin-row"
+                    style={{
+                      gridTemplateColumns: "0.6fr 1.6fr 0.7fr 0.5fr 0.6fr",
+                      cursor: "pointer",
+                      borderColor: isTopTen ? "rgba(34, 197, 94, 0.25)" : undefined,
+                      background: isTopTen ? "rgba(236, 253, 245, 0.75)" : undefined,
+                    }}
+                    onClick={() => onOpenSubmission(s)}
+                  >
+                    <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontWeight: 900 }}>{i < 3 ? ["🥇", "🥈", "🥉"][i] : `#${i + 1}`}</div>
+                    <div className="task-admin-title">{user?.name || "Unknown"}</div>
+                    <div className={`skill-badge skill-${s.skillLevel.toLowerCase()}`}>{s.skillLevel}</div>
+                    <div style={{ textAlign: "right", fontFamily: "'IBM Plex Mono', monospace", fontWeight: 900 }}>{s.totalScore}/40</div>
+                    <div style={{ textAlign: "right" }}>
+                      <button className="btn-primary sm" onClick={e => { e.stopPropagation(); onOpenSubmission(s); }}>Open</button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TaskSubmissionDetailModal({ submission, user, task, onClose }) {
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal modal-wide" onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <div>
+            <h3>{user?.name || "Candidate"} • Task Submission</h3>
+            <div className="modal-sub">{task?.title || "Daily Task"}</div>
+          </div>
+          <button className="close-btn" onClick={onClose}>✕</button>
+        </div>
+        <div className="modal-body scrollable">
+          <div className="score-chips-row">
+            <span>Prompt: {submission.scores.promptScore}/10</span>
+            <span>Task: {submission.scores.taskScore}/20</span>
+            <span>Eval: {submission.scores.evaluationScore}/10</span>
+            <span className="total-chip">Total: {submission.totalScore}/40</span>
+            <span className={`skill-badge skill-${submission.skillLevel.toLowerCase()}`}>{submission.skillLevel}</span>
+            {submission.flags?.map(f => <span key={f} className="flag-chip">⚠ {f.replace(/_/g, " ")}</span>)}
+          </div>
+
+          {submission.feedback?.length > 0 && (
+            <div className="answer-item">
+              <div className="answer-label">AI Feedback</div>
+              <div className="feedback-list">
+                {submission.feedback.slice(0, 10).map(item => <div key={item} className="feedback-item">{item}</div>)}
+              </div>
+            </div>
+          )}
+
+          <div className="answer-item">
+            <div className="answer-label">Candidate Answer</div>
+            <div className="answer-text">{submission.answers}</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function normalizeTask(id, data = {}) {
+  return {
+    id,
+    title: data.title || "",
+    description: data.description || "",
+    createdBy: data.createdBy || "",
+    createdAt: getIsoDate(data.createdAt),
+    deadline: getIsoDate(data.deadline),
+    active: Boolean(data.active),
+    submissionCount: Number(data.submissionCount || 0),
+  };
+}
+
+function normalizeTaskSubmission(id, data = {}) {
+  const scores = {
+    promptScore: Number(data.scores?.promptScore || 0),
+    taskScore: Number(data.scores?.taskScore || 0),
+    evaluationScore: Number(data.scores?.evaluationScore || 0),
+  };
+  const totalScore = Number.isFinite(data.totalScore)
+    ? data.totalScore
+    : scores.promptScore + scores.taskScore + scores.evaluationScore;
+
+  return {
+    id,
+    taskId: data.taskId || "",
+    userId: data.userId || "",
+    answers: typeof data.answers === "string" ? data.answers : "",
+    scores,
+    totalScore,
+    skillLevel: data.skillLevel || getSkillLevel(totalScore),
+    flags: Array.isArray(data.flags) ? data.flags : [],
+    feedback: Array.isArray(data.feedback) ? data.feedback : [],
+    submittedAt: getIsoDate(data.submittedAt) || data.submittedAtIso || "",
+  };
 }
 
 function getSkillLevel(totalScore) {
@@ -388,16 +534,45 @@ async function evaluateAssessmentWithAI(answers, integrityFlags) {
   }
 }
 
+async function evaluateDailyTaskWithAI({ taskId, answers }) {
+  if (!firebaseAuth?.currentUser) throw new Error("Not signed in");
+  const token = await firebaseAuth.currentUser.getIdToken();
+
+  const response = await fetch("/api/evaluate-task", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ taskId, answers }),
+  });
+
+  if (!response.ok) {
+    let message = "Could not submit task.";
+    try {
+      const payload = await response.json();
+      message = payload?.error || message;
+    } catch {
+      message = await response.text();
+    }
+    throw new Error(message);
+  }
+
+  return response.json();
+}
+
 // ─── App State ────────────────────────────────────────────────────────────
 function App() {
   const [users, setUsers] = useState([]);
   const [responses, setResponses] = useState([]);
+  const [tasks, setTasks] = useState([]);
+  const [taskSubmissions, setTaskSubmissions] = useState([]);
   const [currentUser, setCurrentUser] = useState(null);
   const [view, setView] = useState("login"); // login | signup | assessment | admin | candidate_dashboard
   const theme = "light";
   const [notification, setNotification] = useState(null);
   const [authReady, setAuthReady] = useState(!firebaseReady);
-  const db = { users, responses };
+  const db = { users, responses, tasks, taskSubmissions };
 
   const notify = useCallback((msg, type = "success") => {
     setNotification({ msg, type });
@@ -446,6 +621,8 @@ function App() {
     if (!firestore || !currentUser) {
       setUsers([]);
       setResponses([]);
+      setTasks([]);
+      setTaskSubmissions([]);
       return;
     }
 
@@ -465,9 +642,31 @@ function App() {
       error => notify(`Could not load responses: ${error.message}`, "error")
     );
 
+    const unsubscribeTasks = onSnapshot(
+      query(collection(firestore, "tasks"), orderBy("deadline", "desc")),
+      snapshot => setTasks(snapshot.docs.map(taskDoc => normalizeTask(taskDoc.id, taskDoc.data()))),
+      error => notify(`Could not load tasks: ${error.message}`, "error")
+    );
+
+    const submissionsQuery = currentUser.role === "admin"
+      ? query(collection(firestore, "task_submissions"), orderBy("submittedAt", "desc"))
+      : query(
+        collection(firestore, "task_submissions"),
+        where("userId", "==", currentUser.id),
+        orderBy("submittedAt", "desc")
+      );
+
+    const unsubscribeTaskSubmissions = onSnapshot(
+      submissionsQuery,
+      snapshot => setTaskSubmissions(snapshot.docs.map(subDoc => normalizeTaskSubmission(subDoc.id, subDoc.data()))),
+      error => notify(`Could not load task submissions: ${error.message}`, "error")
+    );
+
     return () => {
       unsubscribeUsers();
       unsubscribeResponses();
+      unsubscribeTasks();
+      unsubscribeTaskSubmissions();
     };
   }, [currentUser, notify]);
 
@@ -525,6 +724,9 @@ function App() {
       )}
       {view === "candidate_dashboard" && currentUser?.role === "candidate" && (
         <CandidateDashboard db={db} currentUser={currentUser} setView={setView} logout={logout} />
+      )}
+      {view === "daily_tasks" && currentUser?.role === "candidate" && (
+        <DailyTasksPage db={db} currentUser={currentUser} setView={setView} logout={logout} notify={notify} />
       )}
       {view === "admin" && currentUser?.role === "admin" && (
         <AdminDashboard db={db} currentUser={currentUser} logout={logout} notify={notify} />
@@ -850,6 +1052,240 @@ function CandidateDashboard({ db, currentUser, setView, logout }) {
   );
 }
 
+// ─── DAILY TASKS (CANDIDATE) ───────────────────────────────────────────────
+function DailyTasksPage({ db, currentUser, setView, logout, notify }) {
+  const [selectedTaskId, setSelectedTaskId] = useState("");
+  const [draft, setDraft] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  const mySubmissionsByTask = new Map(
+    db.taskSubmissions
+      .filter(s => s.userId === currentUser.id)
+      .map(s => [s.taskId, s])
+  );
+
+  const activeTasks = db.tasks
+    .filter(t => t.active)
+    .sort((a, b) => (a.deadline || "").localeCompare(b.deadline || ""));
+
+  const selectedTask = selectedTaskId
+    ? db.tasks.find(t => t.id === selectedTaskId)
+    : null;
+
+  useEffect(() => {
+    if (!selectedTaskId) return;
+    const key = `daily_task_draft_${currentUser.id}_${selectedTaskId}`;
+    const saved = localStorage.getItem(key);
+    setDraft(saved || "");
+  }, [currentUser.id, selectedTaskId]);
+
+  useEffect(() => {
+    if (!selectedTaskId) return;
+    const key = `daily_task_draft_${currentUser.id}_${selectedTaskId}`;
+    localStorage.setItem(key, draft);
+  }, [currentUser.id, selectedTaskId, draft]);
+
+  const mySubmission = selectedTask ? mySubmissionsByTask.get(selectedTask.id) : null;
+  const deadlineMs = selectedTask?.deadline ? new Date(selectedTask.deadline).getTime() : 0;
+  const isLate = deadlineMs ? Date.now() > deadlineMs : false;
+  const canSubmit = Boolean(selectedTask && !mySubmission && !isLate);
+
+  const submit = async () => {
+    if (!selectedTask) return;
+    if (!draft.trim()) return notify("Write your answer before submitting.", "error");
+    if (!canSubmit) return;
+
+    setSubmitting(true);
+    try {
+      await evaluateDailyTaskWithAI({ taskId: selectedTask.id, answers: draft.trim() });
+      localStorage.removeItem(`daily_task_draft_${currentUser.id}_${selectedTask.id}`);
+      notify("Task submitted and AI-scored.");
+      setDraft("");
+    } catch (error) {
+      notify(error.message || "Could not submit task.", "error");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="main-layout">
+      <Sidebar role="candidate" current="daily_tasks" setView={setView} logout={logout} user={currentUser} />
+      <div className="content-area">
+        <div className="page-header">
+          <div>
+            <h2 className="page-title">Daily Tasks</h2>
+            <p className="page-sub">Complete case-based CA tasks and track your rank per task.</p>
+          </div>
+        </div>
+
+        {activeTasks.length === 0 ? (
+          <div className="empty-state">
+            <div className="empty-icon">🗓</div>
+            <h3>No active tasks</h3>
+            <p>Check back later for the next case-based task.</p>
+          </div>
+        ) : (
+          <div className="tasks-layout">
+            <div className="task-list">
+              {activeTasks.map(task => {
+                const submitted = mySubmissionsByTask.has(task.id);
+                const deadline = task.deadline ? new Date(task.deadline) : null;
+                const expired = deadline ? Date.now() > deadline.getTime() : false;
+                return (
+                  <button
+                    key={task.id}
+                    className={`task-card ${selectedTaskId === task.id ? "active" : ""}`}
+                    onClick={() => setSelectedTaskId(task.id)}
+                  >
+                    <div className="task-card-top">
+                      <div className="task-title">{task.title}</div>
+                      <div className={`task-status ${submitted ? "submitted" : expired ? "expired" : "open"}`}>
+                        {submitted ? "Submitted" : expired ? "Expired" : "Open"}
+                      </div>
+                    </div>
+                    <div className="task-desc">{task.description}</div>
+                    <div className="task-meta">
+                      <span>Deadline: {deadline ? deadline.toLocaleString() : "N/A"}</span>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="task-detail">
+              {!selectedTask ? (
+                <div className="card">
+                  <h3 className="card-title">Select a task</h3>
+                  <p className="muted">Pick any active task to submit your response and view its leaderboard.</p>
+                </div>
+              ) : (
+                <>
+                  <div className="card">
+                    <h3 className="card-title">{selectedTask.title}</h3>
+                    <div className="muted" style={{ marginBottom: 10 }}>Deadline: {selectedTask.deadline ? new Date(selectedTask.deadline).toLocaleString() : "N/A"}</div>
+                    <div className="task-full-desc">{selectedTask.description}</div>
+                  </div>
+
+                  <div className="card">
+                    <h3 className="card-title">Your Submission</h3>
+
+                    {mySubmission ? (
+                      <div className="submission-summary">
+                        <div className="score-chips-row" style={{ marginBottom: 12 }}>
+                          <span>Prompt: {mySubmission.scores.promptScore}/10</span>
+                          <span>Task: {mySubmission.scores.taskScore}/20</span>
+                          <span>Eval: {mySubmission.scores.evaluationScore}/10</span>
+                          <span className="total-chip">Total: {mySubmission.totalScore}/40</span>
+                          <span className={`skill-badge skill-${mySubmission.skillLevel.toLowerCase()}`}>{mySubmission.skillLevel}</span>
+                        </div>
+                        {mySubmission.feedback?.length > 0 && (
+                          <div className="feedback-list">
+                            {mySubmission.feedback.slice(0, 6).map(item => <div key={item} className="feedback-item">{item}</div>)}
+                          </div>
+                        )}
+                        <div className="answer-text" style={{ marginTop: 14 }}>{mySubmission.answers}</div>
+                      </div>
+                    ) : (
+                      <>
+                        <textarea
+                          className="form-textarea"
+                          rows={10}
+                          value={draft}
+                          onChange={e => setDraft(e.target.value)}
+                          placeholder="Write your response (approach, checks, Excel-ready steps, and verification)..."
+                          disabled={isLate}
+                        />
+                        <div className="task-actions">
+                          <button className="btn-submit" onClick={submit} disabled={!canSubmit || submitting}>
+                            {submitting ? "Scoring…" : isLate ? "Deadline passed" : "Submit Task ✓"}
+                          </button>
+                          {!canSubmit && !isLate && (
+                            <div className="muted" style={{ fontSize: 12 }}>One submission per task is allowed.</div>
+                          )}
+                        </div>
+                      </>
+                    )}
+                  </div>
+
+                  <TaskLeaderboard taskId={selectedTask.id} currentUser={currentUser} />
+                </>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function TaskLeaderboard({ taskId, currentUser }) {
+  const [entries, setEntries] = useState([]);
+
+  useEffect(() => {
+    if (!firestore || !taskId) return;
+    const q = query(
+      collection(firestore, "task_leaderboards", taskId, "entries"),
+      orderBy("totalScore", "desc"),
+      orderBy("submittedAt", "asc")
+    );
+    const unsub = onSnapshot(q, snapshot => {
+      const rows = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+      setEntries(rows);
+    });
+    return () => unsub();
+  }, [taskId]);
+
+  const ranked = entries
+    .map(e => ({
+      userId: e.userId || e.id,
+      candidateName: e.candidateName || "Candidate",
+      totalScore: Number(e.totalScore || 0),
+      skillLevel: e.skillLevel || getSkillLevel(Number(e.totalScore || 0)),
+    }))
+    .sort((a, b) => b.totalScore - a.totalScore);
+
+  const topTenCount = ranked.length ? Math.max(1, Math.ceil(ranked.length * 0.1)) : 0;
+  const myRank = ranked.findIndex(r => r.userId === currentUser.id) + 1;
+
+  return (
+    <div className="card">
+      <h3 className="card-title">Leaderboard</h3>
+      <div className="muted" style={{ marginBottom: 14 }}>Ranked by total score • Top 10% highlighted</div>
+      {!ranked.length ? (
+        <div className="empty-chart">No submissions yet</div>
+      ) : (
+        <div className="task-leaderboard">
+          <div className="task-lb-head">
+            <div>Rank</div>
+            <div>Candidate</div>
+            <div>Skill</div>
+            <div style={{ textAlign: "right" }}>Score</div>
+          </div>
+          {ranked.map((r, i) => {
+            const isTopTen = i < topTenCount;
+            const isMe = r.userId === currentUser.id;
+            return (
+              <div
+                key={r.userId}
+                className={`task-lb-row rank-${i + 1} ${isTopTen ? "top-ten" : ""} ${isMe ? "me" : ""}`}
+              >
+                <div className="task-lb-rank">{i < 3 ? ["🥇", "🥈", "🥉"][i] : `#${i + 1}`}</div>
+                <div className="task-lb-name">{r.candidateName}{isMe ? " (You)" : ""}</div>
+                <div className={`skill-badge skill-${r.skillLevel.toLowerCase()}`}>{r.skillLevel}</div>
+                <div className="task-lb-score">{r.totalScore}/40</div>
+              </div>
+            );
+          })}
+          {myRank > 0 && (
+            <div className="muted" style={{ marginTop: 12 }}>Your rank: #{myRank} of {ranked.length}</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── ASSESSMENT PAGE ──────────────────────────────────────────────────────
 function AssessmentPage({ db, currentUser, setView, notify, logout }) {
   const existing = db.responses.find(r => r.userId === currentUser.id);
@@ -1115,6 +1551,9 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
   const [selectedCandidate, setSelectedCandidate] = useState(null);
   const [filters, setFilters] = useState({ domain: "All", experience: "All", aiUsage: "All" });
   const [scoringModal, setScoringModal] = useState(null);
+  const [taskForm, setTaskForm] = useState({ title: "", description: "", deadline: "" });
+  const [taskViewer, setTaskViewer] = useState(null);
+  const [taskSubmissionModal, setTaskSubmissionModal] = useState(null);
 
   const responses = db.responses;
   const candidates = db.users.filter(u => u.role === "candidate");
@@ -1177,6 +1616,24 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
             user={db.users.find(u => u.id === selectedCandidate.userId)}
             onScore={() => setScoringModal(selectedCandidate)}
             onClose={() => setSelectedCandidate(null)}
+          />
+        )}
+
+        {taskViewer && (
+          <TaskSubmissionsViewer
+            task={taskViewer}
+            db={db}
+            onClose={() => { setTaskViewer(null); setTaskSubmissionModal(null); }}
+            onOpenSubmission={setTaskSubmissionModal}
+          />
+        )}
+
+        {taskSubmissionModal && (
+          <TaskSubmissionDetailModal
+            submission={taskSubmissionModal}
+            user={db.users.find(u => u.id === taskSubmissionModal.userId)}
+            task={db.tasks.find(t => t.id === taskSubmissionModal.taskId)}
+            onClose={() => setTaskSubmissionModal(null)}
           />
         )}
 
@@ -1336,6 +1793,156 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
             </div>
           </>
         )}
+
+        {tab === "tasks" && (
+          <>
+            <div className="page-header">
+              <div><h2 className="page-title">Daily Tasks</h2><p className="page-sub">Create daily tasks, manage status, and track submissions</p></div>
+            </div>
+
+            <div className="card">
+              <h3 className="card-title">Create Daily Task</h3>
+              <div className="two-col" style={{ gridTemplateColumns: "1.1fr 0.9fr" }}>
+                <div>
+                  <div className="form-group">
+                    <label>Title</label>
+                    <input
+                      className="form-input"
+                      value={taskForm.title}
+                      onChange={e => setTaskForm(f => ({ ...f, title: e.target.value }))}
+                      placeholder="e.g., GST Reconciliation: Sales Register vs GSTR-1"
+                    />
+                  </div>
+                  <div className="form-group">
+                    <label>Description</label>
+                    <textarea
+                      className="form-textarea"
+                      rows={6}
+                      value={taskForm.description}
+                      onChange={e => setTaskForm(f => ({ ...f, description: e.target.value }))}
+                      placeholder="Write a case-based task (audit/GST/Ind AS/reconciliation) with realistic constraints, documents, and expected outputs."
+                    />
+                  </div>
+                </div>
+                <div>
+                  <div className="form-group">
+                    <label>Deadline</label>
+                    <input
+                      className="form-input"
+                      type="datetime-local"
+                      value={taskForm.deadline}
+                      onChange={e => setTaskForm(f => ({ ...f, deadline: e.target.value }))}
+                    />
+                  </div>
+                  <button
+                    className="btn-primary"
+                    onClick={async () => {
+                      if (!taskForm.title.trim() || !taskForm.description.trim() || !taskForm.deadline) {
+                        notify("Provide title, description, and deadline.", "error");
+                        return;
+                      }
+                      try {
+                        await addDoc(collection(firestore, "tasks"), {
+                          title: taskForm.title.trim(),
+                          description: taskForm.description.trim(),
+                          deadline: new Date(taskForm.deadline),
+                          active: true,
+                          createdBy: currentUser.id,
+                          createdAt: serverTimestamp(),
+                          submissionCount: 0,
+                        });
+                        setTaskForm({ title: "", description: "", deadline: "" });
+                        notify("Task created.");
+                      } catch (error) {
+                        notify(error.message || "Could not create task.", "error");
+                      }
+                    }}
+                  >
+                    Create Task
+                  </button>
+                  <div className="auth-note" style={{ marginTop: 12 }}>
+                    Tasks appear to all candidates. Candidates can submit once before deadline; submissions are AI-scored and ranked per task.
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="card">
+              <h3 className="card-title">Manage Tasks</h3>
+              {!db.tasks.length ? (
+                <div className="empty-chart">No tasks created yet</div>
+              ) : (
+                <div className="task-admin-table">
+                  <div className="task-admin-head">
+                    <div>Title</div>
+                    <div>Deadline</div>
+                    <div>Status</div>
+                    <div style={{ textAlign: "right" }}>Submissions</div>
+                    <div style={{ textAlign: "right" }}>Actions</div>
+                  </div>
+                  {db.tasks
+                    .slice()
+                    .sort((a, b) => (b.deadline || "").localeCompare(a.deadline || ""))
+                    .map(task => {
+                      const deadline = task.deadline ? new Date(task.deadline) : null;
+                      const expired = deadline ? Date.now() > deadline.getTime() : false;
+                      const status = task.active ? (expired ? "Expired" : "Active") : "Inactive";
+                      return (
+                        <div key={task.id} className="task-admin-row">
+                          <div className="task-admin-title">{task.title}</div>
+                          <div className="muted">{deadline ? deadline.toLocaleString() : "N/A"}</div>
+                          <div className={`task-status-pill ${task.active ? (expired ? "expired" : "active") : "inactive"}`}>{status}</div>
+                          <div style={{ textAlign: "right", fontFamily: "'IBM Plex Mono', monospace" }}>{task.submissionCount || 0}</div>
+                          <div style={{ textAlign: "right" }}>
+                            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", flexWrap: "wrap" }}>
+                              <button className="btn-outline sm" onClick={() => setTaskViewer(task)}>View</button>
+                              <button
+                                className="btn-outline sm"
+                                onClick={async () => {
+                                  try {
+                                    await updateDoc(doc(firestore, "tasks", task.id), { active: !task.active });
+                                  } catch (error) {
+                                    notify(error.message || "Could not update task.", "error");
+                                  }
+                                }}
+                              >
+                                {task.active ? "Deactivate" : "Activate"}
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                </div>
+              )}
+            </div>
+
+            <div className="card">
+              <h3 className="card-title">Task Submissions (Quick View)</h3>
+              {!db.taskSubmissions.length ? (
+                <div className="empty-chart">No task submissions yet</div>
+              ) : (
+                <div className="candidate-list">
+                  {db.taskSubmissions.slice(0, 20).map((s, i) => {
+                    const user = db.users.find(u => u.id === s.userId);
+                    const task = db.tasks.find(t => t.id === s.taskId);
+                    return (
+                      <div key={s.id} className="candidate-row" style={{ cursor: "default" }}>
+                        <div className="rank-num">#{i + 1}</div>
+                        <div className="candidate-info">
+                          <div className="candidate-name">{user?.name || "Unknown"}</div>
+                          <div className="candidate-meta">{task?.title || "Task"}</div>
+                        </div>
+                        <div className={`skill-badge skill-${s.skillLevel.toLowerCase()}`}>{s.skillLevel}</div>
+                        <div className="total-score">{s.totalScore}<span>/40</span></div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </>
+        )}
       </div>
     </div>
   );
@@ -1457,11 +2064,13 @@ function Sidebar({ role, current, setView, logout, user }) {
   const candidateLinks = [
     { id: "candidate_dashboard", label: "Dashboard", icon: "⊞" },
     { id: "assessment", label: "Assessment", icon: "✎" },
+    { id: "daily_tasks", label: "Daily Tasks", icon: "🗓" },
   ];
   const adminLinks = [
     { id: "overview", label: "Overview", icon: "⊞" },
     { id: "candidates", label: "Candidates", icon: "👥" },
     { id: "leaderboard", label: "Leaderboard", icon: "🏆" },
+    { id: "tasks", label: "Daily Tasks", icon: "🗓" },
   ];
   const links = role === "admin" ? adminLinks : candidateLinks;
 
@@ -1919,6 +2528,48 @@ function CSS() {
     .hist-val { font-size: 10px; color: #fff; font-weight: 700; }
     .hist-label { font-size: 11px; color: var(--muted); margin-top: 4px; font-family: 'IBM Plex Mono', monospace; }
     .empty-chart { color: var(--muted); font-size: 13px; text-align: center; padding: 40px; }
+
+    /* Daily Tasks */
+    .tasks-layout { display: grid; grid-template-columns: 360px 1fr; gap: 16px; align-items: start; }
+    .task-list { display: flex; flex-direction: column; gap: 12px; }
+    .task-card { width: 100%; text-align: left; background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 14px; cursor: pointer; transition: 0.15s; }
+    .task-card:hover { transform: translateY(-1px); border-color: rgba(35, 88, 187, 0.35); }
+    .task-card.active { border-color: rgba(35, 88, 187, 0.55); box-shadow: 0 12px 30px rgba(16, 24, 40, 0.08); }
+    .task-card-top { display: flex; align-items: start; justify-content: space-between; gap: 10px; }
+    .task-title { font-weight: 900; font-size: 15px; color: var(--text); line-height: 1.2; }
+    .task-desc { margin-top: 8px; font-size: 13px; color: var(--muted); line-height: 1.45; max-height: 58px; overflow: hidden; }
+    .task-meta { margin-top: 10px; font-size: 11px; color: var(--muted); font-family: 'IBM Plex Mono', monospace; }
+    .task-status { font-size: 11px; font-weight: 900; border-radius: 999px; padding: 6px 10px; border: 1px solid var(--border); }
+    .task-status.open { background: #ecfdf5; border-color: rgba(34, 197, 94, 0.28); color: #166534; }
+    .task-status.submitted { background: #eff6ff; border-color: rgba(37, 99, 235, 0.25); color: #1d4ed8; }
+    .task-status.expired { background: #fff7ed; border-color: rgba(251, 146, 60, 0.35); color: #9a3412; }
+    .task-detail { display: flex; flex-direction: column; gap: 14px; }
+    .task-full-desc { color: var(--text); line-height: 1.7; font-size: 14px; white-space: pre-wrap; }
+    .task-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; }
+
+    .task-leaderboard { display: flex; flex-direction: column; gap: 6px; }
+    .task-lb-head { display: grid; grid-template-columns: 70px 1.6fr 150px 110px; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--border); color: var(--muted); font-size: 12px; font-weight: 900; }
+    .task-lb-row { display: grid; grid-template-columns: 70px 1.6fr 150px 110px; gap: 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 12px; background: rgba(255,255,255,0.7); }
+    .task-lb-row.top-ten { border-color: rgba(34, 197, 94, 0.25); background: rgba(236, 253, 245, 0.8); }
+    .task-lb-row.me { box-shadow: 0 0 0 2px rgba(35, 88, 187, 0.18); }
+    .task-lb-rank { font-family: 'IBM Plex Mono', monospace; font-weight: 900; }
+    .task-lb-name { font-weight: 900; }
+    .task-lb-score { text-align: right; font-family: 'IBM Plex Mono', monospace; font-weight: 900; }
+
+    .task-admin-table { display: flex; flex-direction: column; gap: 10px; }
+    .task-admin-head { display: grid; grid-template-columns: 1.7fr 1fr 0.7fr 0.5fr 0.6fr; gap: 12px; padding: 10px 12px; border-bottom: 1px solid var(--border); color: var(--muted); font-weight: 900; font-size: 12px; }
+    .task-admin-row { display: grid; grid-template-columns: 1.7fr 1fr 0.7fr 0.5fr 0.6fr; gap: 12px; padding: 12px; border: 1px solid var(--border); border-radius: 14px; background: rgba(255,255,255,0.75); align-items: center; }
+    .task-admin-title { font-weight: 900; }
+    .task-status-pill { font-size: 11px; font-weight: 900; padding: 6px 10px; border-radius: 999px; border: 1px solid var(--border); width: fit-content; }
+    .task-status-pill.active { background: #eff6ff; border-color: rgba(37, 99, 235, 0.22); color: #1d4ed8; }
+    .task-status-pill.expired { background: #fff7ed; border-color: rgba(251, 146, 60, 0.28); color: #9a3412; }
+    .task-status-pill.inactive { background: #f1f5f9; border-color: rgba(148, 163, 184, 0.45); color: #475569; }
+
+    @media (max-width: 1100px) {
+      .tasks-layout { grid-template-columns: 1fr; }
+      .task-lb-head, .task-lb-row { grid-template-columns: 70px 1.6fr 120px 90px; }
+      .task-admin-head, .task-admin-row { grid-template-columns: 1.4fr 1fr 0.7fr 0.5fr 0.7fr; }
+    }
 
     /* Admin */
     .filter-bar { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
