@@ -87,6 +87,57 @@ function normalizeEvaluation(raw) {
   };
 }
 
+function heuristicEvaluateTask({ taskTitle, taskDescription, answer }) {
+  const text = String(answer || "");
+  const lower = text.toLowerCase();
+  const len = text.trim().length;
+
+  const hasSteps = /\b(step\s*\d+|1\.|2\.|3\.|\-\s|•\s)/i.test(text);
+  const hasTables = /\b(table|pivot|vlookup|xlookup|sumifs|filter|power query)\b/i.test(text);
+  const hasChecks = /\b(check|reconcile|tie\s*out|cross[- ]check|validate|verify|control|audit\s+trail)\b/i.test(text);
+  const hasNumbers = /\d{2,}/.test(text);
+  const hasDomain = /\b(gst|gstr-?1|gstr-?3b|itc|ind\s*as|audit|vouching|sampling|materiality|reconciliation|ledger)\b/i.test(text);
+
+  const promptScore = clampInt(
+    (len > 700 ? 6 : len > 350 ? 4 : len > 120 ? 2 : 1) + (hasSteps ? 2 : 0) + (hasTables ? 2 : 0),
+    0,
+    10
+  );
+
+  const taskScore = clampInt(
+    (hasDomain ? 10 : 6) + (hasTables ? 4 : 0) + (hasNumbers ? 2 : 0) + (hasSteps ? 3 : 0),
+    0,
+    20
+  );
+
+  const evaluationScore = clampInt((hasChecks ? 6 : 3) + (lower.includes("risk") ? 2 : 0) + (lower.includes("limitation") ? 2 : 0), 0, 10);
+  const totalScore = clampInt(promptScore + taskScore + evaluationScore, 0, 40);
+
+  const flags = [];
+  if (len < 120) flags.push("generic_answer");
+  if (!hasChecks) flags.push("no_checks");
+  if (!hasNumbers) flags.push("missing_numbers");
+
+  const feedback = [
+    hasSteps ? "Good: You outlined a clear step-by-step approach." : "Add a step-by-step approach (numbered steps) for clarity.",
+    hasTables ? "Good: You suggested Excel-ready techniques (e.g., Pivot/VLOOKUP/SUMIFS/Power Query)." : "Include Excel-ready steps (Pivot/SUMIFS/Power Query) for practical execution.",
+    hasChecks ? "Good: You included verification/reconciliation checks." : "Add verification checks (tie-outs, cross-checks, control checks) before concluding.",
+    hasNumbers ? "Good: You referenced quantitative elements." : "Add example thresholds, tolerances, or sample calculations to demonstrate professional judgement.",
+  ].slice(0, 6);
+
+  return {
+    scores: { promptScore, taskScore, evaluationScore },
+    totalScore,
+    skillLevel: getSkillLevel(totalScore),
+    flags,
+    feedback,
+    meta: {
+      taskTitle: String(taskTitle || "").slice(0, 160),
+      taskDescriptionHint: String(taskDescription || "").slice(0, 240),
+    },
+  };
+}
+
 const TASK_RUBRIC = `
 You are scoring a DAILY SKILL TASK submission for a Chartered Accountant (CA).
 
@@ -149,42 +200,49 @@ export default async function handler(req, res) {
 
   if (!existingQuery.empty) return res.status(409).json({ error: "You have already submitted for this task" });
 
-  if (!process.env.OPENAI_API_KEY) {
-    return res.status(503).json({ error: "OPENAI_API_KEY is not configured" });
-  }
-
   let evaluation;
-  try {
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-    const response = await openai.chat.completions.create({
-      model: process.env.OPENAI_EVAL_MODEL || "gpt-4o-mini",
-      response_format: {
-        type: "json_schema",
-        json_schema: {
-          name: "task_evaluation",
-          strict: true,
-          schema: TASK_EVALUATION_SCHEMA,
-        },
-      },
-      messages: [
-        { role: "system", content: `${TASK_RUBRIC}\nReturn only JSON that matches the supplied schema.` },
-        {
-          role: "user",
-          content: JSON.stringify({
-            task: { id: taskId, title: task.title || "", description: task.description || "", deadline: deadline.toISOString() },
-            candidate: { uid },
-            answer: answers,
-          }),
-        },
-      ],
-    });
+  let evaluationSource = "openai";
+  let fallbackReason = null;
 
-    const raw = response.choices[0]?.message?.content;
-    if (!raw) throw new Error("OpenAI returned no output");
-    evaluation = normalizeEvaluation(JSON.parse(raw));
-  } catch (error) {
-    console.error("Task AI evaluation failed", error);
-    return res.status(500).json({ error: "AI evaluation failed" });
+  if (!process.env.OPENAI_API_KEY) {
+    evaluation = heuristicEvaluateTask({ taskTitle: task.title, taskDescription: task.description, answer: answers });
+    evaluationSource = "openai_key_missing_fallback";
+    fallbackReason = "OPENAI_API_KEY is not configured";
+  } else {
+    try {
+      const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+      const response = await openai.chat.completions.create({
+        model: process.env.OPENAI_EVAL_MODEL || "gpt-4o-mini",
+        response_format: {
+          type: "json_schema",
+          json_schema: {
+            name: "task_evaluation",
+            strict: true,
+            schema: TASK_EVALUATION_SCHEMA,
+          },
+        },
+        messages: [
+          { role: "system", content: `${TASK_RUBRIC}\nReturn only JSON that matches the supplied schema.` },
+          {
+            role: "user",
+            content: JSON.stringify({
+              task: { id: taskId, title: task.title || "", description: task.description || "", deadline: deadline.toISOString() },
+              candidate: { uid },
+              answer: answers,
+            }),
+          },
+        ],
+      });
+
+      const raw = response.choices[0]?.message?.content;
+      if (!raw) throw new Error("OpenAI returned no output");
+      evaluation = normalizeEvaluation(JSON.parse(raw));
+    } catch (error) {
+      console.error("Task AI evaluation failed", error);
+      evaluation = heuristicEvaluateTask({ taskTitle: task.title, taskDescription: task.description, answer: answers });
+      evaluationSource = "openai_error_fallback";
+      fallbackReason = error?.message || "OpenAI request failed";
+    }
   }
 
   const userSnap = await db.collection("users").doc(uid).get();
@@ -220,6 +278,7 @@ export default async function handler(req, res) {
       skillLevel: evaluation.skillLevel,
       flags: evaluation.flags,
       feedback: evaluation.feedback,
+      evaluationSource,
       submittedAt: now,
       createdAt: now,
     });
@@ -257,5 +316,9 @@ export default async function handler(req, res) {
     );
   });
 
-  return res.status(200).json({ ...evaluation, source: "openai" });
+  return res.status(200).json({
+    ...evaluation,
+    source: evaluationSource,
+    ...(fallbackReason ? { fallbackReason } : {}),
+  });
 }

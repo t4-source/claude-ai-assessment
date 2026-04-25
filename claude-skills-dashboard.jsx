@@ -739,6 +739,9 @@ function App() {
       {view === "daily_tasks" && currentUser?.role === "candidate" && (
         <DailyTasksPage db={db} currentUser={currentUser} setView={setView} logout={logout} notify={notify} />
       )}
+      {view === "daily_task_leaderboards" && currentUser?.role === "candidate" && (
+        <DailyTaskLeaderboardsPage db={db} currentUser={currentUser} setView={setView} logout={logout} />
+      )}
       {view === "admin" && currentUser?.role === "admin" && (
         <AdminDashboard db={db} currentUser={currentUser} logout={logout} notify={notify} />
       )}
@@ -1108,9 +1111,14 @@ function DailyTasksPage({ db, currentUser, setView, logout, notify }) {
 
     setSubmitting(true);
     try {
-      await evaluateDailyTaskWithAI({ taskId: selectedTask.id, answers: draft.trim() });
+      const result = await evaluateDailyTaskWithAI({ taskId: selectedTask.id, answers: draft.trim() });
       localStorage.removeItem(`daily_task_draft_${currentUser.id}_${selectedTask.id}`);
-      notify("Task submitted and AI-scored.");
+      if (result?.source && result.source !== "openai") {
+        const extra = result?.fallbackReason ? ` (${result.fallbackReason})` : "";
+        notify(`Task submitted. Scored using fallback mode${extra}.`, "info");
+      } else {
+        notify("Task submitted and AI-scored.");
+      }
       setDraft("");
     } catch (error) {
       notify(error.message || "Could not submit task.", "error");
@@ -1226,8 +1234,81 @@ function DailyTasksPage({ db, currentUser, setView, logout, notify }) {
                     )}
                   </div>
 
-                  <TaskLeaderboard taskId={selectedTask.id} currentUser={currentUser} />
                 </>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function DailyTaskLeaderboardsPage({ db, currentUser, setView, logout }) {
+  const [selectedTaskId, setSelectedTaskId] = useState("");
+
+  const activeTasks = db.tasks
+    .filter(t => t.active)
+    .sort((a, b) => (a.deadline || "").localeCompare(b.deadline || ""));
+
+  const selectedTask = selectedTaskId
+    ? db.tasks.find(t => t.id === selectedTaskId)
+    : null;
+
+  useEffect(() => {
+    if (selectedTaskId) return;
+    if (activeTasks.length) setSelectedTaskId(activeTasks[0].id);
+  }, [activeTasks, selectedTaskId]);
+
+  return (
+    <div className="main-layout">
+      <Sidebar role="candidate" current="daily_task_leaderboards" setView={setView} logout={logout} user={currentUser} />
+      <div className="content-area daily-tasks-page">
+        <div className="page-header">
+          <div>
+            <h2 className="page-title">Daily Task Leaderboards</h2>
+            <p className="page-sub">Track your rank per task. Leaderboards update in real time.</p>
+          </div>
+        </div>
+
+        {activeTasks.length === 0 ? (
+          <div className="empty-state">
+            <div className="empty-icon">🏆</div>
+            <h3>No active tasks</h3>
+            <p>Leaderboards appear when tasks are active and candidates submit responses.</p>
+          </div>
+        ) : (
+          <div className="tasks-layout">
+            <div className="task-list">
+              {activeTasks.map(task => {
+                const deadline = task.deadline ? new Date(task.deadline) : null;
+                return (
+                  <button
+                    key={task.id}
+                    className={`task-card ${selectedTaskId === task.id ? "active" : ""}`}
+                    onClick={() => setSelectedTaskId(task.id)}
+                  >
+                    <div className="task-card-top">
+                      <div className="task-title">{task.title}</div>
+                      <div className="task-status open">Live</div>
+                    </div>
+                    <div className="task-desc">{task.description}</div>
+                    <div className="task-meta">
+                      <span>Deadline: {deadline ? deadline.toLocaleString() : "N/A"}</span>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="task-detail">
+              {!selectedTask ? (
+                <div className="card">
+                  <h3 className="card-title">Select a task</h3>
+                  <p className="muted">Pick a task to view its leaderboard.</p>
+                </div>
+              ) : (
+                <TaskLeaderboard taskId={selectedTask.id} currentUser={currentUser} />
               )}
             </div>
           </div>
@@ -2137,6 +2218,7 @@ function Sidebar({ role, current, setView, logout, user }) {
     { id: "candidate_dashboard", label: "Dashboard", icon: "⊞" },
     { id: "assessment", label: "Assessment", icon: "✎" },
     { id: "daily_tasks", label: "Daily Tasks", icon: "🗓" },
+    { id: "daily_task_leaderboards", label: "Task Leaderboards", icon: "🏆" },
   ];
   const adminLinks = [
     { id: "overview", label: "Overview", icon: "⊞" },
