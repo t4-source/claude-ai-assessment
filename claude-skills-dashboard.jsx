@@ -129,16 +129,105 @@ function TaskSubmissionsViewer({ task, db, onClose, onOpenSubmission }) {
   );
 }
 
-function TaskSubmissionDetailModal({ submission, user, task, onClose }) {
+function TaskSubmissionManualScoreModal({ submission, user, task, onClose, notify }) {
+  const [scores, setScores] = useState({
+    promptScore: submission?.scores?.promptScore ?? 0,
+    taskScore: submission?.scores?.taskScore ?? 0,
+    evaluationScore: submission?.scores?.evaluationScore ?? 0,
+  });
+  const [saving, setSaving] = useState(false);
+
+  const totalScore = (Number(scores.promptScore) || 0) + (Number(scores.taskScore) || 0) + (Number(scores.evaluationScore) || 0);
+  const skillLevel = getSkillLevel(totalScore);
+  const set = k => e => setScores(s => ({ ...s, [k]: Math.max(0, Math.min(Number(e.target.value) || 0, k === "taskScore" ? 20 : 10)) }));
+
+  const save = async () => {
+    if (!firestore) return;
+    setSaving(true);
+    try {
+      const submissionRef = doc(firestore, "task_submissions", submission.id);
+      const leaderboardRef = doc(firestore, "task_leaderboards", submission.taskId, "entries", submission.userId);
+
+      await updateDoc(submissionRef, {
+        scores,
+        totalScore,
+        skillLevel,
+        evaluationSource: "admin_override",
+        reviewedAt: serverTimestamp(),
+      });
+
+      await setDoc(
+        leaderboardRef,
+        {
+          taskId: submission.taskId,
+          userId: submission.userId,
+          candidateName: user?.name || "Candidate",
+          totalScore,
+          skillLevel,
+          submittedAt: submission.submittedAt,
+        },
+        { merge: true }
+      );
+
+      notify("Task scores updated.");
+      onClose();
+    } catch (error) {
+      notify(error.message || "Could not update task scores.", "error");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <div>
+            <h3>Manual Score Override</h3>
+            <div className="modal-sub">{user?.name || "Candidate"} • {task?.title || "Task"}</div>
+          </div>
+          <button className="close-btn" onClick={onClose}>✕</button>
+        </div>
+        <div className="modal-body">
+          {[{ label: "Prompt Score", key: "promptScore", max: 10 }, { label: "Task Score", key: "taskScore", max: 20 }, { label: "Evaluation Score", key: "evaluationScore", max: 10 }].map(f => (
+            <div key={f.key} className="score-input-row">
+              <label>{f.label} <span className="max-hint">/ {f.max}</span></label>
+              <div className="score-input-wrap">
+                <input type="range" min="0" max={f.max} value={scores[f.key]} onChange={set(f.key)} className="score-range" />
+                <input type="number" min="0" max={f.max} value={scores[f.key]} onChange={set(f.key)} className="score-num" />
+              </div>
+            </div>
+          ))}
+          <div className="total-preview">
+            <span>Total Score</span>
+            <span className="total-num">{totalScore} / 40</span>
+            <span className={`skill-badge skill-${skillLevel.toLowerCase()}`}>{skillLevel}</span>
+          </div>
+        </div>
+        <div className="modal-footer">
+          <button className="btn-outline" onClick={onClose} disabled={saving}>Cancel</button>
+          <button className="btn-primary" onClick={save} disabled={saving}>{saving ? "Saving…" : "Save Scores"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TaskSubmissionDetailModal({ submission, user, task, onClose, onManualScore }) {
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal modal-wide" onClick={e => e.stopPropagation()}>
         <div className="modal-header">
           <div>
-            <h3>{user?.name || "Candidate"} • Task Submission</h3>
-            <div className="modal-sub">{task?.title || "Daily Task"}</div>
+            <h3>{user?.name || "Candidate"}'s Task Submission</h3>
+            <div className="modal-sub">{task?.title || "Task"} • {new Date(submission.submittedAt).toLocaleString()}</div>
           </div>
-          <button className="close-btn" onClick={onClose}>✕</button>
+          <div style={{ display: "flex", gap: 8 }}>
+            {typeof onManualScore === "function" && (
+              <button className="btn-primary sm" onClick={onManualScore}>Manual Score</button>
+            )}
+            <button className="close-btn" onClick={onClose}>✕</button>
+          </div>
         </div>
         <div className="modal-body scrollable">
           <div className="score-chips-row">
@@ -147,7 +236,8 @@ function TaskSubmissionDetailModal({ submission, user, task, onClose }) {
             <span>Eval: {submission.scores.evaluationScore}/10</span>
             <span className="total-chip">Total: {submission.totalScore}/40</span>
             <span className={`skill-badge skill-${submission.skillLevel.toLowerCase()}`}>{submission.skillLevel}</span>
-            {submission.flags?.map(f => <span key={f} className="flag-chip">⚠ {f.replace(/_/g, " ")}</span>)}
+            <span>Source: {submission.evaluationSource?.replace(/_/g, " ") || "openai"}</span>
+            {Array.isArray(submission.flags) && submission.flags.map(f => <span key={f} className="flag-chip">⚠ {f.replace(/_/g, " ")}</span>)}
           </div>
 
           {submission.feedback?.length > 0 && (
@@ -1247,8 +1337,14 @@ function DailyTasksPage({ db, currentUser, setView, logout, notify }) {
 function DailyTaskLeaderboardsPage({ db, currentUser, setView, logout }) {
   const [selectedTaskId, setSelectedTaskId] = useState("");
 
-  const activeTasks = db.tasks
-    .filter(t => t.active)
+  const submittedTaskIds = new Set(
+    db.taskSubmissions
+      .filter(s => s.userId === currentUser.id)
+      .map(s => s.taskId)
+  );
+
+  const visibleTasks = db.tasks
+    .filter(t => t.active || submittedTaskIds.has(t.id))
     .sort((a, b) => (a.deadline || "").localeCompare(b.deadline || ""));
 
   const selectedTask = selectedTaskId
@@ -1257,8 +1353,8 @@ function DailyTaskLeaderboardsPage({ db, currentUser, setView, logout }) {
 
   useEffect(() => {
     if (selectedTaskId) return;
-    if (activeTasks.length) setSelectedTaskId(activeTasks[0].id);
-  }, [activeTasks, selectedTaskId]);
+    if (visibleTasks.length) setSelectedTaskId(visibleTasks[0].id);
+  }, [visibleTasks, selectedTaskId]);
 
   return (
     <div className="main-layout">
@@ -1271,7 +1367,7 @@ function DailyTaskLeaderboardsPage({ db, currentUser, setView, logout }) {
           </div>
         </div>
 
-        {activeTasks.length === 0 ? (
+        {visibleTasks.length === 0 ? (
           <div className="empty-state">
             <div className="empty-icon">🏆</div>
             <h3>No active tasks</h3>
@@ -1280,7 +1376,7 @@ function DailyTaskLeaderboardsPage({ db, currentUser, setView, logout }) {
         ) : (
           <div className="tasks-layout">
             <div className="task-list">
-              {activeTasks.map(task => {
+              {visibleTasks.map(task => {
                 const deadline = task.deadline ? new Date(task.deadline) : null;
                 return (
                   <button
@@ -1290,7 +1386,7 @@ function DailyTaskLeaderboardsPage({ db, currentUser, setView, logout }) {
                   >
                     <div className="task-card-top">
                       <div className="task-title">{task.title}</div>
-                      <div className="task-status open">Live</div>
+                      <div className={`task-status ${task.active ? "open" : "expired"}`}>{task.active ? "Live" : "Closed"}</div>
                     </div>
                     <div className="task-desc">{task.description}</div>
                     <div className="task-meta">
@@ -1325,13 +1421,19 @@ function TaskLeaderboard({ taskId, currentUser }) {
     if (!firestore || !taskId) return;
     const q = query(
       collection(firestore, "task_leaderboards", taskId, "entries"),
-      orderBy("totalScore", "desc"),
-      orderBy("submittedAt", "asc")
+      orderBy("totalScore", "desc")
     );
-    const unsub = onSnapshot(q, snapshot => {
-      const rows = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
-      setEntries(rows);
-    });
+    const unsub = onSnapshot(
+      q,
+      snapshot => {
+        const rows = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+        setEntries(rows);
+      },
+      error => {
+        console.error("Could not load task leaderboard", error);
+        setEntries([]);
+      }
+    );
     return () => unsub();
   }, [taskId]);
 
@@ -1653,6 +1755,7 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
   const [taskForm, setTaskForm] = useState({ title: "", description: "", deadline: "" });
   const [taskViewer, setTaskViewer] = useState(null);
   const [taskSubmissionModal, setTaskSubmissionModal] = useState(null);
+  const [taskManualScoreModal, setTaskManualScoreModal] = useState(null);
 
   const responses = db.responses;
   const candidates = db.users.filter(u => u.role === "candidate");
@@ -1733,6 +1836,17 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
             user={db.users.find(u => u.id === taskSubmissionModal.userId)}
             task={db.tasks.find(t => t.id === taskSubmissionModal.taskId)}
             onClose={() => setTaskSubmissionModal(null)}
+            onManualScore={() => setTaskManualScoreModal(taskSubmissionModal)}
+          />
+        )}
+
+        {taskManualScoreModal && (
+          <TaskSubmissionManualScoreModal
+            submission={taskManualScoreModal}
+            user={db.users.find(u => u.id === taskManualScoreModal.userId)}
+            task={db.tasks.find(t => t.id === taskManualScoreModal.taskId)}
+            onClose={() => setTaskManualScoreModal(null)}
+            notify={notify}
           />
         )}
 
