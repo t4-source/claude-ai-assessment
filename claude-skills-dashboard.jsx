@@ -12,6 +12,7 @@ import {
   addDoc,
   collection,
   doc,
+  getDocs,
   getFirestore,
   onSnapshot,
   orderBy,
@@ -20,6 +21,7 @@ import {
   serverTimestamp,
   setDoc,
   updateDoc,
+  writeBatch,
 } from "firebase/firestore";
 
 const EMPTY_ANSWERS = {
@@ -1114,7 +1116,7 @@ function DailyTasksPage({ db, currentUser, setView, logout, notify }) {
   return (
     <div className="main-layout">
       <Sidebar role="candidate" current="daily_tasks" setView={setView} logout={logout} user={currentUser} />
-      <div className="content-area">
+      <div className="content-area daily-tasks-page">
         <div className="page-header">
           <div>
             <h2 className="page-title">Daily Tasks</h2>
@@ -1192,7 +1194,7 @@ function DailyTasksPage({ db, currentUser, setView, logout, notify }) {
                     ) : (
                       <>
                         <textarea
-                          className="form-textarea"
+                          className="form-textarea task-answer"
                           rows={10}
                           value={draft}
                           onChange={e => setDraft(e.target.value)}
@@ -1200,7 +1202,7 @@ function DailyTasksPage({ db, currentUser, setView, logout, notify }) {
                           disabled={isLate}
                         />
                         <div className="task-actions">
-                          <button className="btn-submit" onClick={submit} disabled={!canSubmit || submitting}>
+                          <button className={isLate ? "btn-outline" : "btn-submit"} onClick={submit} disabled={!canSubmit || submitting}>
                             {submitting ? "Scoring…" : isLate ? "Deadline passed" : "Submit Task ✓"}
                           </button>
                           {!canSubmit && !isLate && (
@@ -1900,6 +1902,60 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
                             <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", flexWrap: "wrap" }}>
                               <button className="btn-outline sm" onClick={() => setTaskViewer(task)}>View</button>
                               <button
+                                className="btn-danger sm"
+                                onClick={async () => {
+                                  const ok = window.confirm(
+                                    `Delete this task? This will remove the task, its submissions, and its leaderboard entries.\n\n${task.title}`
+                                  );
+                                  if (!ok) return;
+
+                                  try {
+                                    let batch = writeBatch(firestore);
+                                    let opCount = 0;
+
+                                    const commitAndReset = async () => {
+                                      if (opCount === 0) return;
+                                      await batch.commit();
+                                      batch = writeBatch(firestore);
+                                      opCount = 0;
+                                    };
+
+                                    const queueDelete = ref => {
+                                      batch.delete(ref);
+                                      opCount++;
+                                    };
+
+                                    const subsSnap = await getDocs(
+                                      query(collection(firestore, "task_submissions"), where("taskId", "==", task.id))
+                                    );
+                                    for (const d of subsSnap.docs) {
+                                      queueDelete(d.ref);
+                                      if (opCount >= 450) await commitAndReset();
+                                    }
+
+                                    const lbEntriesSnap = await getDocs(
+                                      collection(firestore, "task_leaderboards", task.id, "entries")
+                                    );
+                                    for (const d of lbEntriesSnap.docs) {
+                                      queueDelete(d.ref);
+                                      if (opCount >= 450) await commitAndReset();
+                                    }
+
+                                    queueDelete(doc(firestore, "task_leaderboards", task.id));
+                                    if (opCount >= 450) await commitAndReset();
+                                    queueDelete(doc(firestore, "tasks", task.id));
+                                    await commitAndReset();
+
+                                    setTaskViewer(v => (v?.id === task.id ? null : v));
+                                    notify("Task deleted.");
+                                  } catch (error) {
+                                    notify(error.message || "Could not delete task.", "error");
+                                  }
+                                }}
+                              >
+                                Delete
+                              </button>
+                              <button
                                 className="btn-outline sm"
                                 onClick={async () => {
                                   try {
@@ -2366,6 +2422,9 @@ function CSS() {
     .btn-outline.sm { padding: 7px 14px; font-size: 13px; }
     .btn-submit { padding: 13px 28px; background: var(--green); color: #fff; border: 1px solid var(--green); border-radius: 8px; font-weight: 800; font-size: 15px; cursor: pointer; font-family: 'Source Sans 3', sans-serif; }
     .btn-submit:disabled { opacity: .6; cursor: not-allowed; }
+    .btn-danger { padding: 11px 20px; border: 1px solid rgba(180, 35, 24, 0.35); background: #fff; color: var(--red); border-radius: 8px; font-weight: 900; font-size: 15px; cursor: pointer; font-family: 'Source Sans 3', sans-serif; transition: background .2s, border-color .2s; }
+    .btn-danger:hover { background: rgba(180, 35, 24, 0.06); border-color: rgba(180, 35, 24, 0.55); }
+    .btn-danger.sm { padding: 7px 14px; font-size: 13px; }
     .btn-score { padding: 6px 14px; background: var(--accent); color: #fff; border: none; border-radius: 8px; font-size: 13px; font-weight: 800; cursor: pointer; font-family: 'Source Sans 3', sans-serif; white-space: nowrap; }
 
     /* Spinner */
@@ -2415,7 +2474,7 @@ function CSS() {
     .logout-btn { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 18px; padding: 4px; }
 
     /* Content */
-    .content-area { flex: 1; width: min(100%, 1280px); max-width: 1280px; margin: 0 auto; padding: 38px 42px 56px; overflow-y: auto; }
+    .content-area { flex: 1; width: min(100%, 1400px); max-width: 1400px; margin: 0 auto; padding: 38px 42px 56px; overflow-y: auto; }
     .page-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 24px; margin-bottom: 28px; }
     .page-title { font-size: 34px; font-weight: 800; color: var(--text); letter-spacing: -0.03em; line-height: 1.1; }
     .page-sub { font-size: 16px; color: var(--muted); margin-top: 6px; }
@@ -2533,26 +2592,33 @@ function CSS() {
     .empty-chart { color: var(--muted); font-size: 13px; text-align: center; padding: 40px; }
 
     /* Daily Tasks */
-    .tasks-layout { display: grid; grid-template-columns: 360px 1fr; gap: 16px; align-items: start; }
+    .daily-tasks-page .page-title { font-size: 32px; letter-spacing: -0.02em; }
+    .daily-tasks-page .page-sub { font-size: 15px; }
+    .tasks-layout { display: grid; grid-template-columns: 420px 1fr; gap: 18px; align-items: start; }
     .task-list { display: flex; flex-direction: column; gap: 12px; }
-    .task-card { width: 100%; text-align: left; background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 14px; cursor: pointer; transition: 0.15s; }
+    .task-card { width: 100%; text-align: left; background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 16px; cursor: pointer; transition: 0.15s; box-shadow: 0 10px 24px rgba(20, 32, 51, 0.06); }
     .task-card:hover { transform: translateY(-1px); border-color: rgba(35, 88, 187, 0.35); }
     .task-card.active { border-color: rgba(35, 88, 187, 0.55); box-shadow: 0 12px 30px rgba(16, 24, 40, 0.08); }
     .task-card-top { display: flex; align-items: start; justify-content: space-between; gap: 10px; }
-    .task-title { font-weight: 900; font-size: 15px; color: var(--text); line-height: 1.2; }
-    .task-desc { margin-top: 8px; font-size: 13px; color: var(--muted); line-height: 1.45; max-height: 58px; overflow: hidden; }
+    .task-title { font-weight: 900; font-size: 16px; color: var(--text); line-height: 1.2; letter-spacing: -0.01em; }
+    .task-desc { margin-top: 10px; font-size: 13px; color: var(--muted); line-height: 1.55; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
     .task-meta { margin-top: 10px; font-size: 11px; color: var(--muted); font-family: 'IBM Plex Mono', monospace; }
     .task-status { font-size: 11px; font-weight: 900; border-radius: 999px; padding: 6px 10px; border: 1px solid var(--border); }
     .task-status.open { background: #ecfdf5; border-color: rgba(34, 197, 94, 0.28); color: #166534; }
     .task-status.submitted { background: #eff6ff; border-color: rgba(37, 99, 235, 0.25); color: #1d4ed8; }
     .task-status.expired { background: #fff7ed; border-color: rgba(251, 146, 60, 0.35); color: #9a3412; }
     .task-detail { display: flex; flex-direction: column; gap: 14px; }
+    .task-detail .card { border-radius: 16px; padding: 26px 28px; }
     .task-full-desc { color: var(--text); line-height: 1.7; font-size: 14px; white-space: pre-wrap; }
     .task-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; }
+
+    .task-answer { min-height: 280px; font-size: 16px; padding: 16px; }
+    .task-answer:disabled { background: #f8fafc; }
 
     .task-leaderboard { display: flex; flex-direction: column; gap: 6px; }
     .task-lb-head { display: grid; grid-template-columns: 70px 1.6fr 150px 110px; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--border); color: var(--muted); font-size: 12px; font-weight: 900; }
     .task-lb-row { display: grid; grid-template-columns: 70px 1.6fr 150px 110px; gap: 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 12px; background: rgba(255,255,255,0.7); }
+    .task-lb-row:hover { border-color: rgba(35, 88, 187, 0.28); }
     .task-lb-row.top-ten { border-color: rgba(34, 197, 94, 0.25); background: rgba(236, 253, 245, 0.8); }
     .task-lb-row.me { box-shadow: 0 0 0 2px rgba(35, 88, 187, 0.18); }
     .task-lb-rank { font-family: 'IBM Plex Mono', monospace; font-weight: 900; }
