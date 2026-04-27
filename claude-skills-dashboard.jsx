@@ -9,7 +9,6 @@ import {
   updateProfile,
 } from "firebase/auth";
 import {
-  addDoc,
   collection,
   doc,
   getDocs,
@@ -22,18 +21,17 @@ import {
   setDoc,
   updateDoc,
   writeBatch,
+  addDoc,
 } from "firebase/firestore";
+import {
+  getStorage,
+  ref as storageRef,
+  uploadBytesResumable,
+  getDownloadURL,
+  deleteObject,
+} from "firebase/storage";
 
-const EMPTY_ANSWERS = {
-  sectionA: "",
-  promptUsed: "",
-  claudeOutput: "",
-  candidateImprovements: "",
-  sectionC: "",
-  sectionD: "",
-  sectionE: "",
-};
-
+// ─── Firebase bootstrap ────────────────────────────────────────────────────
 const FIREBASE_CONFIG = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
   authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
@@ -47,12 +45,36 @@ const firebaseReady = Boolean(
   FIREBASE_CONFIG.apiKey &&
   FIREBASE_CONFIG.authDomain &&
   FIREBASE_CONFIG.projectId &&
+  FIREBASE_CONFIG.storageBucket &&
   FIREBASE_CONFIG.appId
 );
 
 const firebaseApp = firebaseReady ? getApps()[0] || initializeApp(FIREBASE_CONFIG) : null;
 const firebaseAuth = firebaseApp ? getAuth(firebaseApp) : null;
 const firestore = firebaseApp ? getFirestore(firebaseApp) : null;
+const storage = firebaseApp ? getStorage(firebaseApp) : null;
+
+// ─── Constants ─────────────────────────────────────────────────────────────
+const MAX_FILE_BYTES = 200 * 1024 * 1024; // 200 MB
+const ALLOWED_MIME_PREFIXES = ["video/", "image/", "application/pdf", "application/"];
+const ALLOWED_EXTENSIONS = [
+  "mp4","mov","avi","mkv","webm","wmv",          // video
+  "jpg","jpeg","png","gif","webp","heic","heif",  // image
+  "pdf","doc","docx","xls","xlsx","ppt","pptx",  // document
+];
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1048576).toFixed(1)} MB`;
+}
+
+function getFileType(name = "") {
+  const ext = name.split(".").pop()?.toLowerCase() || "";
+  if (["mp4","mov","avi","mkv","webm","wmv"].includes(ext)) return "video";
+  if (["jpg","jpeg","png","gif","webp","heic","heif"].includes(ext)) return "image";
+  return "document";
+}
 
 function getIsoDate(value) {
   if (!value) return "";
@@ -61,202 +83,29 @@ function getIsoDate(value) {
   return "";
 }
 
-function TaskSubmissionsViewer({ task, db, onClose, onOpenSubmission }) {
-  const submissions = db.taskSubmissions
-    .filter(s => s.taskId === task.id)
-    .slice()
-    .sort((a, b) => b.totalScore - a.totalScore);
-
-  const topTenCount = submissions.length ? Math.max(1, Math.ceil(submissions.length * 0.1)) : 0;
-
-  return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal modal-wide" onClick={e => e.stopPropagation()}>
-        <div className="modal-header">
-          <div>
-            <h3>{task.title}</h3>
-            <div className="modal-sub">{submissions.length} submissions • Ranked by score</div>
-          </div>
-          <button className="close-btn" onClick={onClose}>✕</button>
-        </div>
-        <div className="modal-body scrollable">
-          <div className="answer-item">
-            <div className="answer-label">Task Description</div>
-            <div className="answer-text">{task.description}</div>
-          </div>
-
-          {!submissions.length ? (
-            <div className="empty-chart">No submissions yet</div>
-          ) : (
-            <div className="task-admin-table" style={{ marginTop: 12 }}>
-              <div className="task-admin-head" style={{ gridTemplateColumns: "0.6fr 1.6fr 0.7fr 0.5fr 0.6fr" }}>
-                <div>Rank</div>
-                <div>Candidate</div>
-                <div>Skill</div>
-                <div style={{ textAlign: "right" }}>Score</div>
-                <div style={{ textAlign: "right" }}>Open</div>
-              </div>
-              {submissions.map((s, i) => {
-                const user = db.users.find(u => u.id === s.userId);
-                const isTopTen = i < topTenCount;
-                return (
-                  <div
-                    key={s.id}
-                    className="task-admin-row"
-                    style={{
-                      gridTemplateColumns: "0.6fr 1.6fr 0.7fr 0.5fr 0.6fr",
-                      cursor: "pointer",
-                      borderColor: isTopTen ? "rgba(34, 197, 94, 0.25)" : undefined,
-                      background: isTopTen ? "rgba(236, 253, 245, 0.75)" : undefined,
-                    }}
-                    onClick={() => onOpenSubmission(s)}
-                  >
-                    <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontWeight: 900 }}>{i < 3 ? ["🥇", "🥈", "🥉"][i] : `#${i + 1}`}</div>
-                    <div className="task-admin-title">{user?.name || "Unknown"}</div>
-                    <div className={`skill-badge skill-${s.skillLevel.toLowerCase()}`}>{s.skillLevel}</div>
-                    <div style={{ textAlign: "right", fontFamily: "'IBM Plex Mono', monospace", fontWeight: 900 }}>{s.totalScore}/40</div>
-                    <div style={{ textAlign: "right" }}>
-                      <button className="btn-primary sm" onClick={e => { e.stopPropagation(); onOpenSubmission(s); }}>Open</button>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
+function getSkillLevel(totalScore) {
+  if (totalScore < 16) return "Beginner";
+  if (totalScore < 28) return "Intermediate";
+  return "Advanced";
 }
 
-function TaskSubmissionManualScoreModal({ submission, user, task, onClose, notify }) {
-  const [scores, setScores] = useState({
-    promptScore: submission?.scores?.promptScore ?? 0,
-    taskScore: submission?.scores?.taskScore ?? 0,
-    evaluationScore: submission?.scores?.evaluationScore ?? 0,
-  });
-  const [saving, setSaving] = useState(false);
+function clampScore(value, max) {
+  return Math.max(0, Math.min(max, Math.round(Number(value) || 0)));
+}
 
-  const totalScore = (Number(scores.promptScore) || 0) + (Number(scores.taskScore) || 0) + (Number(scores.evaluationScore) || 0);
-  const skillLevel = getSkillLevel(totalScore);
-  const set = k => e => setScores(s => ({ ...s, [k]: Math.max(0, Math.min(Number(e.target.value) || 0, k === "taskScore" ? 20 : 10)) }));
-
-  const save = async () => {
-    if (!firestore) return;
-    setSaving(true);
-    try {
-      const submissionRef = doc(firestore, "task_submissions", submission.id);
-      const leaderboardRef = doc(firestore, "task_leaderboards", submission.taskId, "entries", submission.userId);
-
-      await updateDoc(submissionRef, {
-        scores,
-        totalScore,
-        skillLevel,
-        evaluationSource: "admin_override",
-        reviewedAt: serverTimestamp(),
-      });
-
-      await setDoc(
-        leaderboardRef,
-        {
-          taskId: submission.taskId,
-          userId: submission.userId,
-          candidateName: user?.name || "Candidate",
-          totalScore,
-          skillLevel,
-          submittedAt: submission.submittedAt,
-        },
-        { merge: true }
-      );
-
-      notify("Task scores updated.");
-      onClose();
-    } catch (error) {
-      notify(error.message || "Could not update task scores.", "error");
-    } finally {
-      setSaving(false);
-    }
+// ─── Normalizers ──────────────────────────────────────────────────────────
+function normalizeUser(id, data = {}, authUser = null) {
+  const email = data.email || authUser?.email || "";
+  return {
+    id,
+    name: data.name || authUser?.displayName || email.split("@")[0] || "User",
+    email,
+    role: data.role || "candidate",
+    domain: data.domain || "N/A",
+    experience: data.experience || "N/A",
+    aiUsage: data.aiUsage || "N/A",
+    createdAt: getIsoDate(data.createdAt),
   };
-
-  return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal" onClick={e => e.stopPropagation()}>
-        <div className="modal-header">
-          <div>
-            <h3>Manual Score Override</h3>
-            <div className="modal-sub">{user?.name || "Candidate"} • {task?.title || "Task"}</div>
-          </div>
-          <button className="close-btn" onClick={onClose}>✕</button>
-        </div>
-        <div className="modal-body">
-          {[{ label: "Prompt Score", key: "promptScore", max: 10 }, { label: "Task Score", key: "taskScore", max: 20 }, { label: "Evaluation Score", key: "evaluationScore", max: 10 }].map(f => (
-            <div key={f.key} className="score-input-row">
-              <label>{f.label} <span className="max-hint">/ {f.max}</span></label>
-              <div className="score-input-wrap">
-                <input type="range" min="0" max={f.max} value={scores[f.key]} onChange={set(f.key)} className="score-range" />
-                <input type="number" min="0" max={f.max} value={scores[f.key]} onChange={set(f.key)} className="score-num" />
-              </div>
-            </div>
-          ))}
-          <div className="total-preview">
-            <span>Total Score</span>
-            <span className="total-num">{totalScore} / 40</span>
-            <span className={`skill-badge skill-${skillLevel.toLowerCase()}`}>{skillLevel}</span>
-          </div>
-        </div>
-        <div className="modal-footer">
-          <button className="btn-outline" onClick={onClose} disabled={saving}>Cancel</button>
-          <button className="btn-primary" onClick={save} disabled={saving}>{saving ? "Saving…" : "Save Scores"}</button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function TaskSubmissionDetailModal({ submission, user, task, onClose, onManualScore }) {
-  return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal modal-wide" onClick={e => e.stopPropagation()}>
-        <div className="modal-header">
-          <div>
-            <h3>{user?.name || "Candidate"}'s Task Submission</h3>
-            <div className="modal-sub">{task?.title || "Task"} • {new Date(submission.submittedAt).toLocaleString()}</div>
-          </div>
-          <div style={{ display: "flex", gap: 8 }}>
-            {typeof onManualScore === "function" && (
-              <button className="btn-primary sm" onClick={onManualScore}>Manual Score</button>
-            )}
-            <button className="close-btn" onClick={onClose}>✕</button>
-          </div>
-        </div>
-        <div className="modal-body scrollable">
-          <div className="score-chips-row">
-            <span>Prompt: {submission.scores.promptScore}/10</span>
-            <span>Task: {submission.scores.taskScore}/20</span>
-            <span>Eval: {submission.scores.evaluationScore}/10</span>
-            <span className="total-chip">Total: {submission.totalScore}/40</span>
-            <span className={`skill-badge skill-${submission.skillLevel.toLowerCase()}`}>{submission.skillLevel}</span>
-            <span>Source: {submission.evaluationSource?.replace(/_/g, " ") || "openai"}</span>
-            {Array.isArray(submission.flags) && submission.flags.map(f => <span key={f} className="flag-chip">⚠ {f.replace(/_/g, " ")}</span>)}
-          </div>
-
-          {submission.feedback?.length > 0 && (
-            <div className="answer-item">
-              <div className="answer-label">AI Feedback</div>
-              <div className="feedback-list">
-                {submission.feedback.slice(0, 10).map(item => <div key={item} className="feedback-item">{item}</div>)}
-              </div>
-            </div>
-          )}
-
-          <div className="answer-item">
-            <div className="answer-label">Candidate Answer</div>
-            <div className="answer-text">{submission.answers}</div>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
 }
 
 function normalizeTask(id, data = {}) {
@@ -286,489 +135,98 @@ function normalizeTaskSubmission(id, data = {}) {
     id,
     taskId: data.taskId || "",
     userId: data.userId || "",
-    answers: typeof data.answers === "string" ? data.answers : "",
+    textAnswer: typeof data.textAnswer === "string" ? data.textAnswer : "",
+    files: Array.isArray(data.files) ? data.files : [],
     scores,
     totalScore,
     skillLevel: data.skillLevel || getSkillLevel(totalScore),
     flags: Array.isArray(data.flags) ? data.flags : [],
     feedback: Array.isArray(data.feedback) ? data.feedback : [],
     submittedAt: getIsoDate(data.submittedAt) || data.submittedAtIso || "",
+    scoredAt: getIsoDate(data.scoredAt) || "",
+    evaluationSource: data.evaluationSource || "pending",
   };
 }
 
-function getSkillLevel(totalScore) {
-  if (totalScore < 16) return "Beginner";
-  if (totalScore < 28) return "Intermediate";
-  return "Advanced";
-}
-
-function normalizeUser(id, data = {}, authUser = null) {
-  const email = data.email || authUser?.email || "";
-  return {
-    id,
-    name: data.name || authUser?.displayName || email.split("@")[0] || "User",
-    email,
-    role: data.role || "candidate",
-    domain: data.domain || "N/A",
-    experience: data.experience || "N/A",
-    aiUsage: data.aiUsage || "N/A",
-    createdAt: getIsoDate(data.createdAt),
-  };
-}
-
-function normalizeResponse(id, data = {}) {
-  const scores = {
-    promptScore: Number(data.scores?.promptScore || 0),
-    taskScore: Number(data.scores?.taskScore || 0),
-    evaluationScore: Number(data.scores?.evaluationScore || 0),
-  };
-  const totalScore = Number.isFinite(data.totalScore)
-    ? data.totalScore
-    : scores.promptScore + scores.taskScore + scores.evaluationScore;
-
-  return {
-    id,
-    userId: data.userId || "",
-    submittedAt: getIsoDate(data.submittedAt) || data.submittedAtIso || "",
-    answers: { ...EMPTY_ANSWERS, ...(data.answers || {}) },
-    scores,
-    totalScore,
-    skillLevel: data.skillLevel || getSkillLevel(totalScore),
-    flags: Array.isArray(data.flags) ? data.flags : [],
-    integritySignals: Array.isArray(data.integritySignals) ? data.integritySignals : [],
-    aiEvaluation: data.aiEvaluation || null,
-    evaluationSource: data.evaluationSource || "manual",
-  };
-}
-
-const ANSWER_FIELDS = Object.keys(EMPTY_ANSWERS);
-const FIELD_LABELS = {
-  sectionA: "Section A",
-  promptUsed: "Prompt Used",
-  claudeOutput: "AI Output",
-  candidateImprovements: "Improvements",
-  sectionC: "Section C",
-  sectionD: "Section D",
-  sectionE: "Section E",
-};
-
-function clampScore(value, max) {
-  return Math.max(0, Math.min(max, Math.round(Number(value) || 0)));
-}
-
-function uniqueList(values) {
-  return [...new Set(values.filter(Boolean))];
-}
-
-function normalizeForCompare(text = "") {
-  return text
-    .toLowerCase()
-    .replace(/[₹$€£]\s*[\d,.]+/g, " amount ")
-    .replace(/\d+(\.\d+)?%?/g, " number ")
-    .replace(/[^a-z0-9\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function tokenize(text) {
-  return normalizeForCompare(text)
-    .split(" ")
-    .filter(token => token.length > 2);
-}
-
-function levenshteinRatio(a, b) {
-  const left = normalizeForCompare(a).slice(0, 1500);
-  const right = normalizeForCompare(b).slice(0, 1500);
-  if (!left || !right) return 0;
-
-  const previous = Array.from({ length: right.length + 1 }, (_, i) => i);
-  for (let i = 1; i <= left.length; i++) {
-    let prevDiagonal = previous[0];
-    previous[0] = i;
-    for (let j = 1; j <= right.length; j++) {
-      const old = previous[j];
-      const cost = left[i - 1] === right[j - 1] ? 0 : 1;
-      previous[j] = Math.min(previous[j] + 1, previous[j - 1] + 1, prevDiagonal + cost);
-      prevDiagonal = old;
-    }
-  }
-
-  return 1 - previous[right.length] / Math.max(left.length, right.length);
-}
-
-function tokenJaccard(a, b) {
-  const left = new Set(tokenize(a));
-  const right = new Set(tokenize(b));
-  if (!left.size || !right.size) return 0;
-
-  let intersection = 0;
-  left.forEach(token => {
-    if (right.has(token)) intersection++;
-  });
-
-  return intersection / new Set([...left, ...right]).size;
-}
-
-function similarityPercent(a, b) {
-  if (!a?.trim() || !b?.trim()) return 0;
-  return Math.round(Math.max(levenshteinRatio(a, b), tokenJaccard(a, b)) * 100);
-}
-
-function band(value, size) {
-  return Math.floor(value / size) * size;
-}
-
-function promptStructureFingerprint(text = "") {
-  const lower = text.toLowerCase();
-  const markers = [];
-  if (/you are|act as|role:/.test(lower)) markers.push("role");
-  if (/your task|task:|analy[sz]e|evaluate|generate|review/.test(lower)) markers.push("task");
-  if (/context:|client|provided|following|i will provide/.test(lower)) markers.push("context");
-  if (/format|output|json|table|checklist|template/.test(lower)) markers.push("output_format");
-  if (/risk score|confidence|priority|high\/medium\/low|1-10/.test(lower)) markers.push("scoring");
-  if (/ind as|gst|gstr|itc|sa \d+|section \d+|benford|beneish/.test(lower)) markers.push("domain_refs");
-  if (/\(\d+\)|\b\d+[.)]/.test(text)) markers.push("numbered_steps");
-  if (/\n\s*[-*•]/.test(text)) markers.push("bullets");
-  if (/\|/.test(text)) markers.push("table_columns");
-  if (/issue|amount|reference|recommend(ed|ation)|action/.test(lower)) markers.push("audit_fields");
-
-  const labels = text.match(/\b[A-Z][A-Za-z ]{2,22}:/g) || [];
-  markers.push(`labels_${Math.min(labels.length, 6)}`);
-  markers.push(`sentences_${band((text.match(/[.!?]/g) || []).length, 4)}`);
-  markers.push(`length_${band(text.length, 250)}`);
-
-  return uniqueList(markers);
-}
-
-function outputPatternFingerprint(text = "") {
-  const lower = text.toLowerCase();
-  const markers = [];
-  if (/based on|analysis complete|found|key findings/.test(lower)) markers.push("summary_intro");
-  if (/\b\d+[.)]/.test(text)) markers.push("numbered_findings");
-  if (/\n\s*[-*•]/.test(text)) markers.push("bulleted_findings");
-  if (/[₹$€£]\s*[\d,.]+|\b\d+(\.\d+)?%/.test(text)) markers.push("quantified");
-  if (/high|medium|low|risk|priority|confidence/.test(lower)) markers.push("risk_labels");
-  if (/issue|finding|recommendation|action|reference/.test(lower)) markers.push("finding_fields");
-  if (/\|/.test(text)) markers.push("table");
-  markers.push(`lines_${band(text.split(/\n+/).filter(Boolean).length, 3)}`);
-  markers.push(`length_${band(text.length, 250)}`);
-  return uniqueList(markers);
-}
-
-function fingerprintSimilarity(left, right) {
-  const a = new Set(left);
-  const b = new Set(right);
-  if (!a.size || !b.size) return 0;
-  let intersection = 0;
-  a.forEach(item => {
-    if (b.has(item)) intersection++;
-  });
-  return intersection / new Set([...a, ...b]).size;
-}
-
-function analyzeIntegrity(answers, priorResponses, currentUserId) {
-  const flags = new Set();
-  const signals = [];
-  const totalChars = ANSWER_FIELDS.reduce((sum, field) => sum + (answers[field]?.trim().length || 0), 0);
-
-  if (answers.sectionA.trim().length < 50 || totalChars < 350) flags.add("low_effort_response");
-  if (ANSWER_FIELDS.some(field => !answers[field]?.trim())) flags.add("incomplete_submission");
-
-  priorResponses
-    .filter(response => response.userId !== currentUserId)
-    .forEach(response => {
-      ANSWER_FIELDS.forEach(field => {
-        const current = answers[field] || "";
-        const previous = response.answers?.[field] || "";
-        if (current.length < 80 || previous.length < 80) return;
-
-        const similarity = similarityPercent(current, previous);
-        if (similarity >= 94) {
-          flags.add("near_duplicate_answer");
-          signals.push({
-            type: "near_duplicate_answer",
-            field: FIELD_LABELS[field],
-            matchedResponseId: response.id,
-            similarity,
-          });
-        }
-        if (field === "sectionA" && similarity >= 80) {
-          flags.add("similar_prompt_text");
-          signals.push({
-            type: "similar_prompt_text",
-            field: FIELD_LABELS[field],
-            matchedResponseId: response.id,
-            similarity,
-          });
-        }
-      });
-
-      const structureSimilarity = fingerprintSimilarity(
-        promptStructureFingerprint(answers.sectionA),
-        promptStructureFingerprint(response.answers?.sectionA || "")
-      );
-      const sectionSimilarity = similarityPercent(answers.sectionA, response.answers?.sectionA || "");
-      if (structureSimilarity >= 0.86 && sectionSimilarity >= 45) {
-        flags.add("same_prompt_structure");
-        signals.push({
-          type: "same_prompt_structure",
-          field: "Section A",
-          matchedResponseId: response.id,
-          similarity: Math.round(structureSimilarity * 100),
-        });
-      }
-
-      const outputSimilarity = fingerprintSimilarity(
-        outputPatternFingerprint(answers.claudeOutput),
-        outputPatternFingerprint(response.answers?.claudeOutput || "")
-      );
-      const outputTextSimilarity = similarityPercent(answers.claudeOutput, response.answers?.claudeOutput || "");
-      if (outputSimilarity >= 0.85 && outputTextSimilarity >= 45) {
-        flags.add("same_output_pattern");
-        signals.push({
-          type: "same_output_pattern",
-          field: "AI Output",
-          matchedResponseId: response.id,
-          similarity: Math.round(outputSimilarity * 100),
-        });
-      }
-    });
-
-  return {
-    flags: [...flags],
-    signals: signals
-      .sort((a, b) => b.similarity - a.similarity)
-      .slice(0, 8),
-  };
-}
-
-function scoreText(text, keywords, minChars, maxScore) {
-  const lower = text.toLowerCase();
-  const keywordHits = keywords.filter(keyword => lower.includes(keyword)).length;
-  const keywordScore = (keywordHits / keywords.length) * maxScore * 0.48;
-  const lengthScore = Math.min(text.trim().length / minChars, 1) * maxScore * 0.34;
-  const structureScore = promptStructureFingerprint(text).length >= 5 ? maxScore * 0.18 : maxScore * 0.08;
-  return clampScore(keywordScore + lengthScore + structureScore, maxScore);
-}
-
-function heuristicEvaluate(answers, flags = []) {
-  const promptScore = scoreText(
-    `${answers.sectionA} ${answers.sectionD} ${answers.sectionE}`,
-    ["role", "act as", "materiality", "audit", "risk", "gst", "tds", "format", "excel", "source"],
-    1200,
-    10
-  );
-  const taskScore = scoreText(
-    `${answers.promptUsed} ${answers.claudeOutput} ${answers.candidateImprovements}`,
-    ["excel", "csv", "formula", "reconcile", "validate", "invoice", "output", "amount", "duplicate", "format"],
-    900,
-    20
-  );
-  const evaluationScore = scoreText(
-    `${answers.sectionC} ${answers.candidateImprovements}`,
-    ["vague", "missing", "source", "evidence", "verify", "formula", "materiality", "follow-up"],
-    500,
-    10
-  );
-  const totalScore = promptScore + taskScore + evaluationScore;
-
-  return {
-    scores: { promptScore, taskScore, evaluationScore },
-    totalScore,
-    skillLevel: getSkillLevel(totalScore),
-    flags,
-    feedback: [
-      "Heuristic fallback score used because the AI evaluator was unavailable.",
-      promptScore < 6 ? "Prompts need clearer CA role, source documents, materiality, checks, and output format." : "Prompts include useful CA context, controls, and deliverable structure.",
-      evaluationScore < 6 ? "Evaluation should identify missing source evidence, formulas, exception thresholds, and follow-up procedures." : "Evaluation shows useful critique of evidence, reliability, and professional use.",
-    ],
-    qualitySignals: {
-      structuredPrompt: promptStructureFingerprint(answers.sectionA).length >= 5,
-      domainSpecific: /gst|gstr|itc|audit|tds|fraud|ind as|tax|trial balance/i.test(Object.values(answers).join(" ")),
-      actionableEvaluation: /recommend|action|improve|verify|evidence|materiality|formula/i.test(`${answers.sectionC} ${answers.candidateImprovements}`),
-      formatSpecified: /format|table|json|checklist|columns|csv|excel/i.test(Object.values(answers).join(" ")),
-    },
-    source: "heuristic_fallback",
-  };
-}
-
-function normalizeEvaluation(data, fallbackFlags) {
-  const scores = {
-    promptScore: clampScore(data?.scores?.promptScore, 10),
-    taskScore: clampScore(data?.scores?.taskScore, 20),
-    evaluationScore: clampScore(data?.scores?.evaluationScore, 10),
-  };
-  const totalScore = clampScore(data?.totalScore ?? scores.promptScore + scores.taskScore + scores.evaluationScore, 40);
-
-  return {
-    scores,
-    totalScore,
-    skillLevel: data?.skillLevel || getSkillLevel(totalScore),
-    flags: uniqueList([...(fallbackFlags || []), ...(Array.isArray(data?.flags) ? data.flags : [])]),
-    feedback: Array.isArray(data?.feedback) ? data.feedback.slice(0, 6) : [],
-    qualitySignals: data?.qualitySignals || {},
-    source: data?.source || "openai",
-  };
-}
-
-async function evaluateAssessmentWithAI(answers, integrityFlags) {
-  try {
-    const response = await fetch("/api/evaluate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ answers }),
-    });
-    if (!response.ok) throw new Error(await response.text());
-    const data = await response.json();
-    return normalizeEvaluation(data, integrityFlags);
-  } catch {
-    return heuristicEvaluate(answers, integrityFlags);
-  }
-}
-
-async function evaluateDailyTaskWithAI({ taskId, answers }) {
-  if (!firebaseAuth?.currentUser) throw new Error("Not signed in");
-  const token = await firebaseAuth.currentUser.getIdToken();
-
-  const response = await fetch("/api/evaluate-task", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify({ taskId, answers }),
-  });
-
-  const rawText = await response.text();
-
-  if (!response.ok) {
-    let message = "Could not submit task.";
-    try {
-      const payload = rawText ? JSON.parse(rawText) : null;
-      message = payload?.error || message;
-    } catch {
-      message = rawText || message;
-    }
-    throw new Error(message);
-  }
-
-  try {
-    return rawText ? JSON.parse(rawText) : {};
-  } catch {
-    return {};
-  }
-}
-
-// ─── App State ────────────────────────────────────────────────────────────
-function App() {
+// ─── App ──────────────────────────────────────────────────────────────────
+export default function App() {
   const [users, setUsers] = useState([]);
-  const [responses, setResponses] = useState([]);
   const [tasks, setTasks] = useState([]);
   const [taskSubmissions, setTaskSubmissions] = useState([]);
   const [currentUser, setCurrentUser] = useState(null);
-  const [view, setView] = useState("login"); // login | signup | assessment | admin | candidate_dashboard
-  const theme = "light";
+  const [view, setView] = useState("login");
   const [notification, setNotification] = useState(null);
   const [authReady, setAuthReady] = useState(!firebaseReady);
-  const db = { users, responses, tasks, taskSubmissions };
+  const db = { users, tasks, taskSubmissions };
 
   const notify = useCallback((msg, type = "success") => {
     setNotification({ msg, type });
-    setTimeout(() => setNotification(null), 3500);
+    setTimeout(() => setNotification(null), 4000);
   }, []);
 
+  // Auth listener
   useEffect(() => {
     if (!firebaseAuth || !firestore) return;
-    let unsubscribeProfile = () => {};
-
-    const unsubscribeAuth = onAuthStateChanged(firebaseAuth, authUser => {
-      unsubscribeProfile();
-
+    let unsubProfile = () => {};
+    const unsubAuth = onAuthStateChanged(firebaseAuth, authUser => {
+      unsubProfile();
       if (!authUser) {
         setCurrentUser(null);
         setAuthReady(true);
         setView("login");
         return;
       }
-
-      unsubscribeProfile = onSnapshot(
-        doc(firestore, "users", authUser.uid),
-        snapshot => {
-          const profile = normalizeUser(authUser.uid, snapshot.exists() ? snapshot.data() : {}, authUser);
-          setCurrentUser(profile);
-          setAuthReady(true);
-          setView(v => {
-            if (v !== "login" && v !== "signup") return v;
-            return profile.role === "admin" ? "admin" : "candidate_dashboard";
-          });
-        },
-        error => {
-          notify(`Could not load user profile: ${error.message}`, "error");
-          setAuthReady(true);
-        }
-      );
+      unsubProfile = onSnapshot(doc(firestore, "users", authUser.uid), snap => {
+        const profile = normalizeUser(authUser.uid, snap.exists() ? snap.data() : {}, authUser);
+        setCurrentUser(profile);
+        setAuthReady(true);
+        setView(v => {
+          if (v !== "login" && v !== "signup") return v;
+          return profile.role === "admin" ? "admin" : "daily_tasks";
+        });
+      }, err => {
+        notify(`Profile error: ${err.message}`, "error");
+        setAuthReady(true);
+      });
     });
-
-    return () => {
-      unsubscribeProfile();
-      unsubscribeAuth();
-    };
+    return () => { unsubProfile(); unsubAuth(); };
   }, [notify]);
 
+  // Firestore listeners
   useEffect(() => {
     if (!firestore || !currentUser) {
-      setUsers([]);
-      setResponses([]);
-      setTasks([]);
-      setTaskSubmissions([]);
+      setUsers([]); setTasks([]); setTaskSubmissions([]);
       return;
     }
 
-    const unsubscribeUsers = currentUser.role === "admin"
-      ? onSnapshot(
-        collection(firestore, "users"),
-        snapshot => setUsers(snapshot.docs.map(userDoc => normalizeUser(userDoc.id, userDoc.data()))),
-        error => notify(`Could not load users: ${error.message}`, "error")
-      )
+    const unsubUsers = currentUser.role === "admin"
+      ? onSnapshot(collection(firestore, "users"),
+          snap => setUsers(snap.docs.map(d => normalizeUser(d.id, d.data()))),
+          err => notify(`Users error: ${err.message}`, "error"))
       : () => {};
 
     if (currentUser.role !== "admin") setUsers([currentUser]);
 
-    const unsubscribeResponses = onSnapshot(
-      query(collection(firestore, "responses"), orderBy("submittedAt", "desc")),
-      snapshot => setResponses(snapshot.docs.map(responseDoc => normalizeResponse(responseDoc.id, responseDoc.data()))),
-      error => notify(`Could not load responses: ${error.message}`, "error")
-    );
-
-    const unsubscribeTasks = onSnapshot(
+    const unsubTasks = onSnapshot(
       query(collection(firestore, "tasks"), orderBy("deadline", "desc")),
-      snapshot => setTasks(snapshot.docs.map(taskDoc => normalizeTask(taskDoc.id, taskDoc.data()))),
-      error => notify(`Could not load tasks: ${error.message}`, "error")
+      snap => setTasks(snap.docs.map(d => normalizeTask(d.id, d.data()))),
+      err => notify(`Tasks error: ${err.message}`, "error")
     );
 
-    const submissionsQuery = currentUser.role === "admin"
+    const subsQuery = currentUser.role === "admin"
       ? query(collection(firestore, "task_submissions"), orderBy("submittedAt", "desc"))
-      : query(
-        collection(firestore, "task_submissions"),
-        where("userId", "==", currentUser.id)
-      );
+      : query(collection(firestore, "task_submissions"), where("userId", "==", currentUser.id));
 
-    const unsubscribeTaskSubmissions = onSnapshot(
-      submissionsQuery,
-      snapshot => {
-        const rows = snapshot.docs.map(subDoc => normalizeTaskSubmission(subDoc.id, subDoc.data()));
+    const unsubSubs = onSnapshot(subsQuery,
+      snap => {
+        const rows = snap.docs.map(d => normalizeTaskSubmission(d.id, d.data()));
         rows.sort((a, b) => (b.submittedAt || "").localeCompare(a.submittedAt || ""));
         setTaskSubmissions(rows);
       },
-      error => notify(`Could not load task submissions: ${error.message}`, "error")
+      err => notify(`Submissions error: ${err.message}`, "error")
     );
 
-    return () => {
-      unsubscribeUsers();
-      unsubscribeResponses();
-      unsubscribeTasks();
-      unsubscribeTaskSubmissions();
-    };
+    return () => { unsubUsers(); unsubTasks(); unsubSubs(); };
   }, [currentUser, notify]);
 
   const logout = useCallback(async () => {
@@ -777,60 +235,38 @@ function App() {
     setView("login");
   }, []);
 
-  if (!firebaseReady) {
-    return (
-      <div className={`app-root ${theme}`}>
-        <style>{CSS(theme)}</style>
-        <FirebaseSetupNotice />
-      </div>
-    );
-  }
+  if (!firebaseReady) return (
+    <div className="app-root"><style>{CSS()}</style><FirebaseSetupNotice /></div>
+  );
 
-  if (!authReady) {
-    return (
-      <div className={`app-root ${theme}`}>
-        <style>{CSS(theme)}</style>
-        <div className="auth-page">
-          <div className="auth-card" style={{ textAlign: "center" }}>
-            <span className="spinner dark" />
-            <h1 className="auth-title">Loading secure session</h1>
-            <p className="auth-sub">Connecting to Firebase Auth and Firestore.</p>
-          </div>
+  if (!authReady) return (
+    <div className="app-root"><style>{CSS()}</style>
+      <div className="auth-page">
+        <div className="auth-card" style={{ textAlign: "center" }}>
+          <span className="spinner dark" />
+          <h1 className="auth-title" style={{ marginTop: 16 }}>Loading…</h1>
+          <p className="auth-sub">Connecting to Firebase.</p>
         </div>
       </div>
-    );
-  }
+    </div>
+  );
 
   return (
-    <div className={`app-root ${theme}`}>
-      <style>{CSS(theme)}</style>
-
-      {/* Notification Toast */}
+    <div className="app-root">
+      <style>{CSS()}</style>
       {notification && (
         <div className={`toast toast-${notification.type}`}>
           <span>{notification.type === "success" ? "✓" : notification.type === "error" ? "✗" : "ℹ"}</span>
           {notification.msg}
         </div>
       )}
-
-      {/* Router */}
-      {view === "login" && (
-        <LoginPage setView={setView} notify={notify} />
-      )}
-      {view === "signup" && (
-        <SignupPage setView={setView} notify={notify} />
-      )}
-      {view === "assessment" && currentUser?.role === "candidate" && (
-        <AssessmentPage db={db} currentUser={currentUser} setView={setView} notify={notify} logout={logout} />
-      )}
-      {view === "candidate_dashboard" && currentUser?.role === "candidate" && (
-        <CandidateDashboard db={db} currentUser={currentUser} setView={setView} logout={logout} />
-      )}
+      {view === "login" && <LoginPage setView={setView} notify={notify} />}
+      {view === "signup" && <SignupPage setView={setView} notify={notify} />}
       {view === "daily_tasks" && currentUser?.role === "candidate" && (
         <DailyTasksPage db={db} currentUser={currentUser} setView={setView} logout={logout} notify={notify} />
       )}
-      {view === "daily_task_leaderboards" && currentUser?.role === "candidate" && (
-        <DailyTaskLeaderboardsPage db={db} currentUser={currentUser} setView={setView} logout={logout} />
+      {view === "leaderboards" && currentUser?.role === "candidate" && (
+        <LeaderboardsPage db={db} currentUser={currentUser} setView={setView} logout={logout} />
       )}
       {view === "admin" && currentUser?.role === "admin" && (
         <AdminDashboard db={db} currentUser={currentUser} logout={logout} notify={notify} />
@@ -839,6 +275,7 @@ function App() {
   );
 }
 
+// ─── Firebase setup notice ─────────────────────────────────────────────────
 function FirebaseSetupNotice() {
   return (
     <div className="auth-page">
@@ -847,24 +284,20 @@ function FirebaseSetupNotice() {
           <div className="logo-icon">CA</div>
           <div>
             <h1 className="auth-title">Firebase Setup Required</h1>
-            <p className="auth-sub">Add Firebase web config variables before deployment.</p>
+            <p className="auth-sub">Add env vars + enable Firebase Storage.</p>
           </div>
         </div>
         <div className="setup-box">
-          <p>Create a Firebase project, enable Email/Password Auth, create Firestore, then add these environment variables in Vercel:</p>
-          <code>VITE_FIREBASE_API_KEY</code>
-          <code>VITE_FIREBASE_AUTH_DOMAIN</code>
-          <code>VITE_FIREBASE_PROJECT_ID</code>
-          <code>VITE_FIREBASE_STORAGE_BUCKET</code>
-          <code>VITE_FIREBASE_MESSAGING_SENDER_ID</code>
-          <code>VITE_FIREBASE_APP_ID</code>
+          {["VITE_FIREBASE_API_KEY","VITE_FIREBASE_AUTH_DOMAIN","VITE_FIREBASE_PROJECT_ID",
+            "VITE_FIREBASE_STORAGE_BUCKET","VITE_FIREBASE_MESSAGING_SENDER_ID","VITE_FIREBASE_APP_ID"]
+            .map(v => <code key={v}>{v}</code>)}
         </div>
       </div>
     </div>
   );
 }
 
-// ─── LOGIN PAGE ───────────────────────────────────────────────────────────
+// ─── Login ─────────────────────────────────────────────────────────────────
 function LoginPage({ setView, notify }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -875,9 +308,8 @@ function LoginPage({ setView, notify }) {
     setLoading(true);
     try {
       await signInWithEmailAndPassword(firebaseAuth, email.trim(), password);
-      notify("Signed in successfully.");
-    } catch (error) {
-      notify(error.message || "Invalid email or password.", "error");
+    } catch (err) {
+      notify(err.message || "Invalid credentials.", "error");
     } finally {
       setLoading(false);
     }
@@ -889,15 +321,14 @@ function LoginPage({ setView, notify }) {
         <div className="auth-logo">
           <div className="logo-icon">CA</div>
           <div>
-            <h1 className="auth-title">AI Skills Assessment</h1>
-            <p className="auth-sub">Chartered Accountant • AI Proficiency Evaluation</p>
+            <h1 className="auth-title">Daily Task Platform</h1>
+            <p className="auth-sub">Chartered Accountant • AI Task Submissions</p>
           </div>
         </div>
-
         <div className="form-group">
-          <label>Email Address</label>
+          <label>Email</label>
           <input className="form-input" type="email" value={email}
-            onChange={e => setEmail(e.target.value)} placeholder="your@email.com"
+            onChange={e => setEmail(e.target.value)} placeholder="you@example.com"
             onKeyDown={e => e.key === "Enter" && handleLogin()} />
         </div>
         <div className="form-group">
@@ -909,25 +340,13 @@ function LoginPage({ setView, notify }) {
         <button className="btn-primary" onClick={handleLogin} disabled={loading}>
           {loading ? <span className="spinner" /> : "Sign In"}
         </button>
-
-        <p className="auth-link">
-          Don't have an account? <button onClick={() => setView("signup")}>Create one</button>
-        </p>
+        <p className="auth-link">No account? <button onClick={() => setView("signup")}>Create one</button></p>
       </div>
-
       <div className="auth-hero">
-        <div className="hero-stats">
-          {[["Role-Based", "CA Scenarios"], ["40 pts", "Structured Score"], ["AI + Excel", "Practical Workflow"]].map(([val, lbl]) => (
-            <div key={lbl} className="hero-stat">
-              <div className="hero-stat-val">{val}</div>
-              <div className="hero-stat-lbl">{lbl}</div>
-            </div>
-          ))}
-        </div>
-        <h2 className="hero-heading">Evaluate AI Readiness for Modern CA Work</h2>
-        <p className="hero-body">Assess how well candidates use AI for audit review, GST reconciliation, Excel-based analysis, report preparation, and professional quality control. The platform focuses on practical judgement, not generic prompt writing.</p>
+        <h2 className="hero-heading">Submit. Record. Get Ranked.</h2>
+        <p className="hero-body">Complete real CA case tasks, upload your screen recording or supporting documents, and get ranked by the admin panel. Track your performance across every task.</p>
         <div className="hero-tags">
-          {["Audit Risk Review", "GST Reconciliation", "Excel and CSV Checks", "Working Paper Output", "AI Reliability Review"].map(t => (
+          {["Screen Recordings","GST Reconciliation","Audit Tasks","Real-Time Leaderboard","Admin Scoring"].map(t => (
             <span key={t} className="hero-tag">{t}</span>
           ))}
         </div>
@@ -936,7 +355,7 @@ function LoginPage({ setView, notify }) {
   );
 }
 
-// ─── SIGNUP PAGE ──────────────────────────────────────────────────────────
+// ─── Signup ────────────────────────────────────────────────────────────────
 function SignupPage({ setView, notify }) {
   const [form, setForm] = useState({ name: "", email: "", password: "", domain: "Audit", experience: "1-3 years", aiUsage: "Beginner" });
   const [loading, setLoading] = useState(false);
@@ -944,13 +363,12 @@ function SignupPage({ setView, notify }) {
   const handleSignup = async () => {
     if (!form.name || !form.email || !form.password) return notify("All fields required.", "error");
     if (form.password.length < 6) return notify("Password must be at least 6 characters.", "error");
-
     setLoading(true);
     try {
-      const credential = await createUserWithEmailAndPassword(firebaseAuth, form.email.trim(), form.password);
-      await updateProfile(credential.user, { displayName: form.name.trim() });
-      await setDoc(doc(firestore, "users", credential.user.uid), {
-        id: credential.user.uid,
+      const cred = await createUserWithEmailAndPassword(firebaseAuth, form.email.trim(), form.password);
+      await updateProfile(cred.user, { displayName: form.name.trim() });
+      await setDoc(doc(firestore, "users", cred.user.uid), {
+        id: cred.user.uid,
         name: form.name.trim(),
         email: form.email.trim(),
         role: "candidate",
@@ -959,10 +377,9 @@ function SignupPage({ setView, notify }) {
         aiUsage: form.aiUsage,
         createdAt: serverTimestamp(),
       });
-      notify("Account created successfully.");
-      setView("candidate_dashboard");
-    } catch (error) {
-      notify(error.message || "Could not create account.", "error");
+      notify("Account created!");
+    } catch (err) {
+      notify(err.message || "Could not create account.", "error");
     } finally {
       setLoading(false);
     }
@@ -976,43 +393,32 @@ function SignupPage({ setView, notify }) {
         <button className="back-btn" onClick={() => setView("login")}>← Back</button>
         <div className="auth-logo">
           <div className="logo-icon">CA</div>
-          <div>
-            <h1 className="auth-title">Create Account</h1>
-            <p className="auth-sub">Join the AI Skills Assessment Platform</p>
-          </div>
+          <div><h1 className="auth-title">Create Account</h1><p className="auth-sub">Join the platform</p></div>
         </div>
-
-        {[["Full Name", "name", "text", "Priya Sharma"],
-          ["Email Address", "email", "email", "priya@example.com"],
-          ["Password", "password", "password", "••••••••"]
-        ].map(([lbl, key, type, ph]) => (
-          <div className="form-group" key={key}>
-            <label>{lbl}</label>
-            <input className="form-input" type={type} value={form[key]} onChange={set(key)} placeholder={ph} />
-          </div>
-        ))}
-
+        {[["Full Name","name","text","Priya Sharma"],["Email","email","email","priya@example.com"],["Password","password","password","••••••••"]]
+          .map(([lbl,key,type,ph]) => (
+            <div className="form-group" key={key}>
+              <label>{lbl}</label>
+              <input className="form-input" type={type} value={form[key]} onChange={set(key)} placeholder={ph} />
+            </div>
+          ))}
         <div className="form-row">
-          <div className="form-group">
-            <label>Domain</label>
+          <div className="form-group"><label>Domain</label>
             <select className="form-input" value={form.domain} onChange={set("domain")}>
               <option>Audit</option><option>Tax</option><option>Advisory</option>
             </select>
           </div>
-          <div className="form-group">
-            <label>Experience</label>
+          <div className="form-group"><label>Experience</label>
             <select className="form-input" value={form.experience} onChange={set("experience")}>
               <option>{"< 1 year"}</option><option>1-3 years</option><option>3-5 years</option><option>5+ years</option>
             </select>
           </div>
-          <div className="form-group">
-            <label>AI Usage Level</label>
+          <div className="form-group"><label>AI Usage</label>
             <select className="form-input" value={form.aiUsage} onChange={set("aiUsage")}>
               <option>Beginner</option><option>Intermediate</option><option>Advanced</option>
             </select>
           </div>
         </div>
-
         <button className="btn-primary" onClick={handleSignup} disabled={loading}>
           {loading ? <span className="spinner" /> : "Create Account"}
         </button>
@@ -1021,197 +427,222 @@ function SignupPage({ setView, notify }) {
   );
 }
 
-// ─── CANDIDATE DASHBOARD ──────────────────────────────────────────────────
-function CandidateDashboard({ db, currentUser, setView, logout }) {
-  const myResponse = db.responses.find(r => r.userId === currentUser.id);
-  const ranked = [...db.responses].sort((a, b) => b.totalScore - a.totalScore);
-  const myRank = myResponse ? ranked.findIndex(r => r.id === myResponse.id) + 1 : null;
-  const avgScore = db.responses.length ? Math.round(db.responses.reduce((sum, r) => sum + r.totalScore, 0) / db.responses.length) : 0;
-  const percentile = myResponse && ranked.length
-    ? Math.round(((ranked.length - myRank + 1) / ranked.length) * 100)
-    : 0;
-  const benchmarkDelta = myResponse ? myResponse.totalScore - avgScore : 0;
+// ─── File Upload Hook ──────────────────────────────────────────────────────
+function useFileUpload({ userId, taskId }) {
+  const [files, setFiles] = useState([]);  // { file, name, size, type, progress, url, error, storagePath }
+  const [uploading, setUploading] = useState(false);
+
+  const validateFile = (file) => {
+    if (file.size > MAX_FILE_BYTES) return `${file.name} exceeds 200 MB limit`;
+    const ext = file.name.split(".").pop()?.toLowerCase() || "";
+    if (!ALLOWED_EXTENSIONS.includes(ext)) return `${file.name} — unsupported file type`;
+    return null;
+  };
+
+  const addFiles = useCallback((incoming) => {
+    const newEntries = [];
+    for (const file of incoming) {
+      const err = validateFile(file);
+      if (err) { alert(err); continue; }
+      newEntries.push({ file, name: file.name, size: file.size, type: getFileType(file.name), progress: 0, url: null, error: null, storagePath: null });
+    }
+    setFiles(prev => [...prev, ...newEntries]);
+  }, []);
+
+  const removeFile = useCallback((index) => {
+    setFiles(prev => {
+      const entry = prev[index];
+      // Delete from Storage if already uploaded
+      if (entry?.storagePath && storage) {
+        deleteObject(storageRef(storage, entry.storagePath)).catch(() => {});
+      }
+      return prev.filter((_, i) => i !== index);
+    });
+  }, []);
+
+  const uploadAll = useCallback(async () => {
+    if (!storage || !userId || !taskId) throw new Error("Storage not configured");
+    const pending = files.filter(f => !f.url && !f.error);
+    if (!pending.length) return files.filter(f => f.url).map(f => ({ name: f.name, url: f.url, size: f.size, type: f.type, storagePath: f.storagePath }));
+
+    setUploading(true);
+    const results = await Promise.all(
+      files.map((entry, index) => {
+        if (entry.url) return Promise.resolve(entry);
+        if (!entry.file) return Promise.resolve(entry);
+        return new Promise((resolve) => {
+          const path = `task_submissions/${taskId}/${userId}/${Date.now()}_${entry.name}`;
+          const ref = storageRef(storage, path);
+          const task = uploadBytesResumable(ref, entry.file);
+          task.on("state_changed",
+            snap => {
+              const progress = Math.round((snap.bytesTransferred / snap.totalBytes) * 100);
+              setFiles(prev => prev.map((f, i) => i === index ? { ...f, progress } : f));
+            },
+            err => {
+              setFiles(prev => prev.map((f, i) => i === index ? { ...f, error: err.message } : f));
+              resolve({ ...entry, error: err.message });
+            },
+            async () => {
+              const url = await getDownloadURL(task.snapshot.ref);
+              setFiles(prev => prev.map((f, i) => i === index ? { ...f, url, storagePath: path, progress: 100 } : f));
+              resolve({ ...entry, url, storagePath: path, progress: 100 });
+            }
+          );
+        });
+      })
+    );
+    setUploading(false);
+    return results.filter(f => f.url).map(f => ({ name: f.name, url: f.url, size: f.size, type: f.type, storagePath: f.storagePath }));
+  }, [files, userId, taskId]);
+
+  return { files, addFiles, removeFile, uploadAll, uploading, setFiles };
+}
+
+// ─── File Drop Zone ────────────────────────────────────────────────────────
+function FileDropZone({ onFiles, disabled }) {
+  const inputRef = useRef();
+  const [dragging, setDragging] = useState(false);
+
+  const handle = (fileList) => {
+    if (disabled) return;
+    onFiles(Array.from(fileList));
+  };
 
   return (
-    <div className="main-layout">
-      <Sidebar role="candidate" current="dashboard" setView={setView} logout={logout} user={currentUser} />
-      <div className="content-area">
-        <div className="page-header">
-          <div>
-            <h2 className="page-title">My Dashboard</h2>
-            <p className="page-sub">Welcome back, {currentUser.name}</p>
-          </div>
-          {myResponse ? (
-            <button className="btn-primary sm" onClick={() => printCandidateReport(currentUser, myResponse, avgScore, myRank, ranked.length)}>
-              Download Report PDF
-            </button>
-          ) : (
-            <button className="btn-primary sm" onClick={() => setView("assessment")}>
-              Start Assessment →
-            </button>
-          )}
-        </div>
-
-        {myResponse ? (
-          <>
-            <div className="stats-grid">
-              {[
-                { label: "Total Score", value: myResponse.totalScore + "/40", color: "accent" },
-                { label: "Rank", value: `#${myRank} of ${ranked.length}`, color: "blue" },
-                { label: "Skill Level", value: myResponse.skillLevel, color: skillColor(myResponse.skillLevel) },
-                { label: "Percentile", value: percentile + "%", color: "purple" },
-              ].map(s => (
-                <div key={s.label} className={`stat-card stat-${s.color}`}>
-                  <div className="stat-label">{s.label}</div>
-                  <div className="stat-value">{s.value}</div>
-                </div>
-              ))}
-            </div>
-
-            <div className="two-col">
-              <div className="card">
-                <h3 className="card-title">Score Breakdown</h3>
-                <div className="score-bars">
-                  {[
-                    { label: "Prompt Engineering", score: myResponse.scores.promptScore, max: 10 },
-                    { label: "Task Submission", score: myResponse.scores.taskScore, max: 20 },
-                    { label: "Output Evaluation", score: myResponse.scores.evaluationScore, max: 10 },
-                  ].map(b => (
-                    <div key={b.label} className="score-bar-row">
-                      <div className="score-bar-label"><span>{b.label}</span><span>{b.score}/{b.max}</span></div>
-                      <div className="score-bar-track">
-                        <div className="score-bar-fill" style={{ width: `${(b.score / b.max) * 100}%` }} />
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              <div className="card">
-                <h3 className="card-title">Percentile Ring</h3>
-                <PercentileRing score={myResponse.totalScore} max={40} />
-                <div className="benchmark-note">
-                  You scored {Math.abs(benchmarkDelta)} points {benchmarkDelta >= 0 ? "above" : "below"} the platform average of {avgScore}/40.
-                </div>
-                {myResponse.flags.length > 0 && (
-                  <div className="flag-alert">
-                    ⚠ {myResponse.flags.map(f => f.replace(/_/g, " ")).join(", ")}
-                  </div>
-                )}
-              </div>
-            </div>
-
-            <div className="two-col">
-              <div className="card">
-                <h3 className="card-title">Benchmarking</h3>
-                <div className="benchmark-grid">
-                  <div><span>Your Score</span><strong>{myResponse.totalScore}/40</strong></div>
-                  <div><span>Average</span><strong>{avgScore}/40</strong></div>
-                  <div><span>Rank</span><strong>#{myRank}</strong></div>
-                  <div><span>Percentile</span><strong>{percentile}%</strong></div>
-                </div>
-              </div>
-
-              <div className="card">
-                <h3 className="card-title">AI Evaluation</h3>
-                <div className="feedback-list">
-                  {(myResponse.aiEvaluation?.feedback?.length ? myResponse.aiEvaluation.feedback : ["No AI feedback was stored for this response."]).map(item => (
-                    <div key={item} className="feedback-item">{item}</div>
-                  ))}
-                </div>
-                <div className="eval-source">Source: {myResponse.evaluationSource.replace(/_/g, " ")}</div>
-              </div>
-            </div>
-
-            <div className="card">
-              <h3 className="card-title">My Submitted Answers</h3>
-              <div className="answers-list">
-                {[
-                  { label: "Section A - Audit Prompt Design", val: myResponse.answers.sectionA },
-                  { label: "Section B - Excel/CSV Prompt", val: myResponse.answers.promptUsed },
-                  { label: "Section B - AI Output Format", val: myResponse.answers.claudeOutput },
-                  { label: "Section B - Validation and Improvements", val: myResponse.answers.candidateImprovements },
-                  { label: "Section C - AI Output Review", val: myResponse.answers.sectionC },
-                  { label: "Section D - Repaired Prompt", val: myResponse.answers.sectionD },
-                  { label: "Section E - Client Deliverable Prompt", val: myResponse.answers.sectionE },
-                ].map(a => (
-                  <div key={a.label} className="answer-item">
-                    <div className="answer-label">{a.label}</div>
-                    <div className="answer-text">{a.val}</div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </>
-        ) : (
-          <div className="empty-state">
-            <div className="empty-icon">📋</div>
-            <h3>No Assessment Submitted</h3>
-            <p>You haven't taken the assessment yet. Complete it to see your AI skills score and ranking.</p>
-            <button className="btn-primary" onClick={() => setView("assessment")}>Begin Assessment</button>
-          </div>
-        )}
-      </div>
+    <div
+      className={`drop-zone ${dragging ? "dragging" : ""} ${disabled ? "disabled" : ""}`}
+      onDragOver={e => { e.preventDefault(); setDragging(true); }}
+      onDragLeave={() => setDragging(false)}
+      onDrop={e => { e.preventDefault(); setDragging(false); handle(e.dataTransfer.files); }}
+      onClick={() => !disabled && inputRef.current?.click()}
+    >
+      <input ref={inputRef} type="file" multiple hidden
+        accept=".mp4,.mov,.avi,.mkv,.webm,.wmv,.jpg,.jpeg,.png,.gif,.webp,.heic,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx"
+        onChange={e => handle(e.target.files)} />
+      <div className="drop-icon">📎</div>
+      <div className="drop-label">{dragging ? "Drop files here" : "Click or drag files here"}</div>
+      <div className="drop-hint">Screen recordings (MP4, MOV), images, or documents • Max 200 MB per file</div>
     </div>
   );
 }
 
-// ─── DAILY TASKS (CANDIDATE) ───────────────────────────────────────────────
+function FileList({ files, onRemove, disabled }) {
+  if (!files.length) return null;
+  return (
+    <div className="file-list">
+      {files.map((f, i) => (
+        <div key={i} className={`file-item ${f.error ? "file-error" : f.url ? "file-done" : ""}`}>
+          <div className="file-icon">{f.type === "video" ? "🎥" : f.type === "image" ? "🖼" : "📄"}</div>
+          <div className="file-info">
+            <div className="file-name">{f.name}</div>
+            <div className="file-meta">
+              {formatBytes(f.size)}
+              {f.error && <span className="file-err-label"> • {f.error}</span>}
+              {f.url && <span className="file-ok-label"> • Uploaded ✓</span>}
+              {!f.url && !f.error && f.progress > 0 && <span> • {f.progress}%</span>}
+            </div>
+            {!f.url && !f.error && f.progress > 0 && (
+              <div className="file-progress-track"><div className="file-progress-bar" style={{ width: `${f.progress}%` }} /></div>
+            )}
+          </div>
+          {!disabled && !f.url && (
+            <button className="file-remove" onClick={() => onRemove(i)}>✕</button>
+          )}
+          {f.url && (
+            <a href={f.url} target="_blank" rel="noreferrer" className="file-view-btn">View</a>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ─── Daily Tasks (Candidate) ───────────────────────────────────────────────
 function DailyTasksPage({ db, currentUser, setView, logout, notify }) {
   const [selectedTaskId, setSelectedTaskId] = useState("");
-  const [draft, setDraft] = useState("");
+  const [textDraft, setTextDraft] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
-  const mySubmissionsByTask = new Map(
-    db.taskSubmissions
-      .filter(s => s.userId === currentUser.id)
-      .map(s => [s.taskId, s])
+  const mySubsByTask = new Map(
+    db.taskSubmissions.filter(s => s.userId === currentUser.id).map(s => [s.taskId, s])
   );
-
-  const activeTasks = db.tasks
-    .filter(t => t.active)
+  const activeTasks = db.tasks.filter(t => t.active)
     .sort((a, b) => (a.deadline || "").localeCompare(b.deadline || ""));
-
-  const selectedTask = selectedTaskId
-    ? db.tasks.find(t => t.id === selectedTaskId)
-    : null;
-
-  useEffect(() => {
-    if (!selectedTaskId) return;
-    const key = `daily_task_draft_${currentUser.id}_${selectedTaskId}`;
-    const saved = localStorage.getItem(key);
-    setDraft(saved || "");
-  }, [currentUser.id, selectedTaskId]);
-
-  useEffect(() => {
-    if (!selectedTaskId) return;
-    const key = `daily_task_draft_${currentUser.id}_${selectedTaskId}`;
-    localStorage.setItem(key, draft);
-  }, [currentUser.id, selectedTaskId, draft]);
-
-  const mySubmission = selectedTask ? mySubmissionsByTask.get(selectedTask.id) : null;
+  const selectedTask = selectedTaskId ? db.tasks.find(t => t.id === selectedTaskId) : null;
+  const mySubmission = selectedTask ? mySubsByTask.get(selectedTask.id) : null;
   const deadlineMs = selectedTask?.deadline ? new Date(selectedTask.deadline).getTime() : 0;
   const isLate = deadlineMs ? Date.now() > deadlineMs : false;
   const canSubmit = Boolean(selectedTask && !mySubmission && !isLate);
 
+  // Per-task file upload state
+  const { files, addFiles, removeFile, uploadAll, uploading } = useFileUpload({
+    userId: currentUser.id,
+    taskId: selectedTaskId,
+  });
+
+  // Restore text draft from localStorage
+  useEffect(() => {
+    if (!selectedTaskId) return;
+    const saved = localStorage.getItem(`task_draft_${currentUser.id}_${selectedTaskId}`);
+    setTextDraft(saved || "");
+  }, [selectedTaskId, currentUser.id]);
+
+  useEffect(() => {
+    if (!selectedTaskId) return;
+    localStorage.setItem(`task_draft_${currentUser.id}_${selectedTaskId}`, textDraft);
+  }, [textDraft, selectedTaskId, currentUser.id]);
+
   const submit = async () => {
-    if (!selectedTask) return;
-    if (!draft.trim()) return notify("Write your answer before submitting.", "error");
-    if (!canSubmit) return;
+    if (!selectedTask || !canSubmit) return;
+    if (!textDraft.trim() && files.length === 0)
+      return notify("Add a written response or at least one file before submitting.", "error");
 
     setSubmitting(true);
     try {
-      const result = await evaluateDailyTaskWithAI({ taskId: selectedTask.id, answers: draft.trim() });
-      localStorage.removeItem(`daily_task_draft_${currentUser.id}_${selectedTask.id}`);
-      if (result?.source && result.source !== "openai") {
-        const extra = result?.fallbackReason ? ` (${result.fallbackReason})` : "";
-        notify(`Task submitted. Scored using fallback mode${extra}.`, "info");
-      } else {
-        notify("Task submitted and AI-scored.");
+      // Upload files first
+      let uploadedFiles = [];
+      if (files.length > 0) {
+        notify("Uploading files…", "info");
+        uploadedFiles = await uploadAll();
+        if (uploadedFiles.length < files.filter(f => !f.error).length)
+          notify("Some files failed to upload but submission will proceed.", "error");
       }
-      setDraft("");
-    } catch (error) {
-      notify(error.message || "Could not submit task.", "error");
+
+      // Write submission document (no AI evaluation — admin scores manually)
+      const subRef = await addDoc(collection(firestore, "task_submissions"), {
+        taskId: selectedTask.id,
+        userId: currentUser.id,
+        textAnswer: textDraft.trim(),
+        files: uploadedFiles,
+        scores: { promptScore: 0, taskScore: 0, evaluationScore: 0 },
+        totalScore: 0,
+        skillLevel: "Pending",
+        flags: [],
+        feedback: [],
+        evaluationSource: "pending",
+        submittedAt: serverTimestamp(),
+        submittedAtIso: new Date().toISOString(),
+      });
+
+      // Placeholder leaderboard entry so admin can see it
+      await setDoc(
+        doc(firestore, "task_leaderboards", selectedTask.id, "entries", currentUser.id),
+        {
+          taskId: selectedTask.id,
+          userId: currentUser.id,
+          candidateName: currentUser.name,
+          totalScore: 0,
+          skillLevel: "Pending",
+          submittedAt: new Date().toISOString(),
+        },
+        { merge: true }
+      );
+
+      localStorage.removeItem(`task_draft_${currentUser.id}_${selectedTask.id}`);
+      notify("Task submitted! Awaiting admin review.");
+    } catch (err) {
+      notify(err.message || "Could not submit task.", "error");
     } finally {
       setSubmitting(false);
     }
@@ -1220,11 +651,11 @@ function DailyTasksPage({ db, currentUser, setView, logout, notify }) {
   return (
     <div className="main-layout">
       <Sidebar role="candidate" current="daily_tasks" setView={setView} logout={logout} user={currentUser} />
-      <div className="content-area daily-tasks-page">
+      <div className="content-area">
         <div className="page-header">
           <div>
             <h2 className="page-title">Daily Tasks</h2>
-            <p className="page-sub">Complete case-based CA tasks and track your rank per task.</p>
+            <p className="page-sub">Complete tasks and upload your screen recording or supporting files.</p>
           </div>
         </div>
 
@@ -1232,21 +663,20 @@ function DailyTasksPage({ db, currentUser, setView, logout, notify }) {
           <div className="empty-state">
             <div className="empty-icon">🗓</div>
             <h3>No active tasks</h3>
-            <p>Check back later for the next case-based task.</p>
+            <p>Check back soon for new case-based tasks from your admin.</p>
           </div>
         ) : (
           <div className="tasks-layout">
+            {/* Task list */}
             <div className="task-list">
               {activeTasks.map(task => {
-                const submitted = mySubmissionsByTask.has(task.id);
+                const submitted = mySubsByTask.has(task.id);
                 const deadline = task.deadline ? new Date(task.deadline) : null;
                 const expired = deadline ? Date.now() > deadline.getTime() : false;
                 return (
-                  <button
-                    key={task.id}
+                  <button key={task.id}
                     className={`task-card ${selectedTaskId === task.id ? "active" : ""}`}
-                    onClick={() => setSelectedTaskId(task.id)}
-                  >
+                    onClick={() => setSelectedTaskId(task.id)}>
                     <div className="task-card-top">
                       <div className="task-title">{task.title}</div>
                       <div className={`task-status ${submitted ? "submitted" : expired ? "expired" : "open"}`}>
@@ -1254,19 +684,18 @@ function DailyTasksPage({ db, currentUser, setView, logout, notify }) {
                       </div>
                     </div>
                     <div className="task-desc">{task.description}</div>
-                    <div className="task-meta">
-                      <span>Deadline: {deadline ? deadline.toLocaleString() : "N/A"}</span>
-                    </div>
+                    <div className="task-meta">Deadline: {deadline ? deadline.toLocaleString() : "N/A"}</div>
                   </button>
                 );
               })}
             </div>
 
+            {/* Task detail */}
             <div className="task-detail">
               {!selectedTask ? (
                 <div className="card">
                   <h3 className="card-title">Select a task</h3>
-                  <p className="muted">Pick any active task to submit your response and view its leaderboard.</p>
+                  <p className="muted">Pick a task from the list to submit your response.</p>
                 </div>
               ) : (
                 <>
@@ -1274,7 +703,9 @@ function DailyTasksPage({ db, currentUser, setView, logout, notify }) {
                     <div className="task-detail-head">
                       <div>
                         <h3 className="task-detail-title">{selectedTask.title}</h3>
-                        <div className="task-detail-sub">Deadline: {selectedTask.deadline ? new Date(selectedTask.deadline).toLocaleString() : "N/A"}</div>
+                        <div className="task-detail-sub">
+                          Deadline: {selectedTask.deadline ? new Date(selectedTask.deadline).toLocaleString() : "N/A"}
+                        </div>
                       </div>
                       <div className={`task-status ${mySubmission ? "submitted" : isLate ? "expired" : "open"}`}>
                         {mySubmission ? "Submitted" : isLate ? "Expired" : "Open"}
@@ -1283,47 +714,111 @@ function DailyTasksPage({ db, currentUser, setView, logout, notify }) {
                     <div className="task-full-desc">{selectedTask.description}</div>
                   </div>
 
+                  {/* Submission area */}
                   <div className="card">
-                    <h3 className="card-title">Your Submission</h3>
+                    <h3 className="card-title">
+                      {mySubmission ? "Your Submission" : "Submit Your Response"}
+                    </h3>
 
                     {mySubmission ? (
-                      <div className="submission-summary">
-                        <div className="score-chips-row" style={{ marginBottom: 12 }}>
-                          <span>Prompt: {mySubmission.scores.promptScore}/10</span>
-                          <span>Task: {mySubmission.scores.taskScore}/20</span>
-                          <span>Eval: {mySubmission.scores.evaluationScore}/10</span>
-                          <span className="total-chip">Total: {mySubmission.totalScore}/40</span>
-                          <span className={`skill-badge skill-${mySubmission.skillLevel.toLowerCase()}`}>{mySubmission.skillLevel}</span>
-                        </div>
-                        {mySubmission.feedback?.length > 0 && (
-                          <div className="feedback-list">
-                            {mySubmission.feedback.slice(0, 6).map(item => <div key={item} className="feedback-item">{item}</div>)}
-                          </div>
-                        )}
-                        <div className="answer-text" style={{ marginTop: 14 }}>{mySubmission.answers}</div>
-                      </div>
-                    ) : (
-                      <>
-                        <textarea
-                          className="form-textarea task-answer"
-                          rows={10}
-                          value={draft}
-                          onChange={e => setDraft(e.target.value)}
-                          placeholder="Write your response (approach, checks, Excel-ready steps, and verification)..."
-                          disabled={isLate}
-                        />
-                        <div className="task-actions">
-                          <button className={isLate ? "btn-outline" : "btn-submit"} onClick={submit} disabled={!canSubmit || submitting}>
-                            {submitting ? "Scoring…" : isLate ? "Deadline passed" : "Submit Task ✓"}
-                          </button>
-                          {!canSubmit && !isLate && (
-                            <div className="muted" style={{ fontSize: 12 }}>One submission per task is allowed.</div>
+                      /* ── Already submitted ── */
+                      <div>
+                        <div className="score-chips-row" style={{ marginBottom: 14 }}>
+                          {mySubmission.evaluationSource === "pending" ? (
+                            <span className="pending-chip">⏳ Awaiting admin review</span>
+                          ) : (
+                            <>
+                              <span>Task: {mySubmission.scores.taskScore}/20</span>
+                              <span>Eval: {mySubmission.scores.evaluationScore}/10</span>
+                              <span className="total-chip">Total: {mySubmission.totalScore}/40</span>
+                              <span className={`skill-badge skill-${mySubmission.skillLevel.toLowerCase()}`}>
+                                {mySubmission.skillLevel}
+                              </span>
+                            </>
                           )}
                         </div>
-                      </>
+
+                        {mySubmission.feedback?.length > 0 && (
+                          <div className="feedback-list" style={{ marginBottom: 16 }}>
+                            {mySubmission.feedback.map((item, i) => (
+                              <div key={i} className="feedback-item">{item}</div>
+                            ))}
+                          </div>
+                        )}
+
+                        {mySubmission.textAnswer && (
+                          <div className="answer-item">
+                            <div className="answer-label">Written Response</div>
+                            <div className="answer-text">{mySubmission.textAnswer}</div>
+                          </div>
+                        )}
+
+                        {mySubmission.files?.length > 0 && (
+                          <div style={{ marginTop: 16 }}>
+                            <div className="answer-label" style={{ marginBottom: 8 }}>Uploaded Files</div>
+                            <div className="file-list">
+                              {mySubmission.files.map((f, i) => (
+                                <div key={i} className="file-item file-done">
+                                  <div className="file-icon">
+                                    {f.type === "video" ? "🎥" : f.type === "image" ? "🖼" : "📄"}
+                                  </div>
+                                  <div className="file-info">
+                                    <div className="file-name">{f.name}</div>
+                                    <div className="file-meta">{formatBytes(f.size)}</div>
+                                  </div>
+                                  <a href={f.url} target="_blank" rel="noreferrer" className="file-view-btn">
+                                    View
+                                  </a>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      /* ── Not yet submitted ── */
+                      <div>
+                        {isLate ? (
+                          <div className="flag-alert">The deadline has passed. Submissions are no longer accepted.</div>
+                        ) : (
+                          <>
+                            <div className="form-group" style={{ marginBottom: 16 }}>
+                              <label>Written Response (optional if uploading a recording)</label>
+                              <textarea
+                                className="form-textarea task-answer"
+                                rows={6}
+                                value={textDraft}
+                                onChange={e => setTextDraft(e.target.value)}
+                                placeholder="Describe your approach, tools used, checks performed, findings, and recommendations…"
+                              />
+                            </div>
+
+                            <div className="upload-section">
+                              <div className="upload-section-header">
+                                <span className="upload-section-title">📹 Screen Recording &amp; Files</span>
+                                <span className="upload-section-hint">Max 200 MB per file • {files.length} file{files.length !== 1 ? "s" : ""} added</span>
+                              </div>
+                              <FileDropZone onFiles={addFiles} disabled={submitting || uploading} />
+                              <FileList files={files} onRemove={removeFile} disabled={submitting || uploading} />
+                            </div>
+
+                            <div className="task-actions">
+                              <div className="upload-tips">
+                                <strong>Tip:</strong> Record your screen while solving the task using OBS, Loom, or QuickTime, then upload the video file directly.
+                              </div>
+                              <button
+                                className="btn-submit"
+                                onClick={submit}
+                                disabled={!canSubmit || submitting || uploading}
+                              >
+                                {submitting || uploading ? "Uploading & Submitting…" : "Submit Task ✓"}
+                              </button>
+                            </div>
+                          </>
+                        )}
+                      </div>
                     )}
                   </div>
-
                 </>
               )}
             </div>
@@ -1334,78 +829,58 @@ function DailyTasksPage({ db, currentUser, setView, logout, notify }) {
   );
 }
 
-function DailyTaskLeaderboardsPage({ db, currentUser, setView, logout }) {
+// ─── Leaderboards (Candidate) ──────────────────────────────────────────────
+function LeaderboardsPage({ db, currentUser, setView, logout }) {
   const [selectedTaskId, setSelectedTaskId] = useState("");
 
   const submittedTaskIds = new Set(
-    db.taskSubmissions
-      .filter(s => s.userId === currentUser.id)
-      .map(s => s.taskId)
+    db.taskSubmissions.filter(s => s.userId === currentUser.id).map(s => s.taskId)
   );
-
   const visibleTasks = db.tasks
     .filter(t => t.active || submittedTaskIds.has(t.id))
-    .sort((a, b) => (a.deadline || "").localeCompare(b.deadline || ""));
-
-  const selectedTask = selectedTaskId
-    ? db.tasks.find(t => t.id === selectedTaskId)
-    : null;
+    .sort((a, b) => (b.deadline || "").localeCompare(a.deadline || ""));
 
   useEffect(() => {
-    if (selectedTaskId) return;
-    if (visibleTasks.length) setSelectedTaskId(visibleTasks[0].id);
-  }, [visibleTasks, selectedTaskId]);
+    if (!selectedTaskId && visibleTasks.length) setSelectedTaskId(visibleTasks[0].id);
+  }, [visibleTasks.length]);
 
   return (
     <div className="main-layout">
-      <Sidebar role="candidate" current="daily_task_leaderboards" setView={setView} logout={logout} user={currentUser} />
-      <div className="content-area daily-tasks-page">
+      <Sidebar role="candidate" current="leaderboards" setView={setView} logout={logout} user={currentUser} />
+      <div className="content-area">
         <div className="page-header">
-          <div>
-            <h2 className="page-title">Daily Task Leaderboards</h2>
-            <p className="page-sub">Track your rank per task. Leaderboards update in real time.</p>
-          </div>
+          <div><h2 className="page-title">Task Leaderboards</h2>
+            <p className="page-sub">Admin-scored rankings update in real time.</p></div>
         </div>
-
         {visibleTasks.length === 0 ? (
           <div className="empty-state">
             <div className="empty-icon">🏆</div>
-            <h3>No active tasks</h3>
-            <p>Leaderboards appear when tasks are active and candidates submit responses.</p>
+            <h3>No tasks yet</h3>
+            <p>Leaderboards appear once tasks are active and submissions are scored.</p>
           </div>
         ) : (
           <div className="tasks-layout">
             <div className="task-list">
-              {visibleTasks.map(task => {
-                const deadline = task.deadline ? new Date(task.deadline) : null;
-                return (
-                  <button
-                    key={task.id}
-                    className={`task-card ${selectedTaskId === task.id ? "active" : ""}`}
-                    onClick={() => setSelectedTaskId(task.id)}
-                  >
-                    <div className="task-card-top">
-                      <div className="task-title">{task.title}</div>
-                      <div className={`task-status ${task.active ? "open" : "expired"}`}>{task.active ? "Live" : "Closed"}</div>
+              {visibleTasks.map(task => (
+                <button key={task.id}
+                  className={`task-card ${selectedTaskId === task.id ? "active" : ""}`}
+                  onClick={() => setSelectedTaskId(task.id)}>
+                  <div className="task-card-top">
+                    <div className="task-title">{task.title}</div>
+                    <div className={`task-status ${task.active ? "open" : "expired"}`}>
+                      {task.active ? "Live" : "Closed"}
                     </div>
-                    <div className="task-desc">{task.description}</div>
-                    <div className="task-meta">
-                      <span>Deadline: {deadline ? deadline.toLocaleString() : "N/A"}</span>
-                    </div>
-                  </button>
-                );
-              })}
+                  </div>
+                  <div className="task-meta">
+                    {task.deadline ? new Date(task.deadline).toLocaleString() : "N/A"}
+                  </div>
+                </button>
+              ))}
             </div>
-
             <div className="task-detail">
-              {!selectedTask ? (
-                <div className="card">
-                  <h3 className="card-title">Select a task</h3>
-                  <p className="muted">Pick a task to view its leaderboard.</p>
-                </div>
-              ) : (
-                <TaskLeaderboard taskId={selectedTask.id} currentUser={currentUser} />
-              )}
+              {selectedTaskId
+                ? <TaskLeaderboard taskId={selectedTaskId} currentUser={currentUser} />
+                : <div className="card"><h3 className="card-title">Select a task</h3></div>}
             </div>
           </div>
         )}
@@ -1414,6 +889,7 @@ function DailyTaskLeaderboardsPage({ db, currentUser, setView, logout }) {
   );
 }
 
+// ─── Task Leaderboard component ────────────────────────────────────────────
 function TaskLeaderboard({ taskId, currentUser }) {
   const [entries, setEntries] = useState([]);
 
@@ -1423,18 +899,10 @@ function TaskLeaderboard({ taskId, currentUser }) {
       collection(firestore, "task_leaderboards", taskId, "entries"),
       orderBy("totalScore", "desc")
     );
-    const unsub = onSnapshot(
-      q,
-      snapshot => {
-        const rows = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
-        setEntries(rows);
-      },
-      error => {
-        console.error("Could not load task leaderboard", error);
-        setEntries([]);
-      }
+    return onSnapshot(q,
+      snap => setEntries(snap.docs.map(d => ({ id: d.id, ...d.data() }))),
+      () => setEntries([])
     );
-    return () => unsub();
   }, [taskId]);
 
   const ranked = entries
@@ -1442,384 +910,117 @@ function TaskLeaderboard({ taskId, currentUser }) {
       userId: e.userId || e.id,
       candidateName: e.candidateName || "Candidate",
       totalScore: Number(e.totalScore || 0),
-      skillLevel: e.skillLevel || getSkillLevel(Number(e.totalScore || 0)),
+      skillLevel: e.skillLevel || "Pending",
     }))
     .sort((a, b) => b.totalScore - a.totalScore);
 
-  const topTenCount = ranked.length ? Math.max(1, Math.ceil(ranked.length * 0.1)) : 0;
+  const topN = ranked.length ? Math.max(1, Math.ceil(ranked.length * 0.1)) : 0;
   const myRank = ranked.findIndex(r => r.userId === currentUser.id) + 1;
 
   return (
     <div className="card">
       <h3 className="card-title">Leaderboard</h3>
-      <div className="muted" style={{ marginBottom: 14 }}>Ranked by total score • Top 10% highlighted</div>
+      <p className="muted" style={{ marginBottom: 14 }}>Admin-scored • Top 10% highlighted</p>
       {!ranked.length ? (
-        <div className="empty-chart">No submissions yet</div>
+        <div className="empty-chart">No scored submissions yet</div>
       ) : (
         <div className="task-leaderboard">
           <div className="task-lb-head">
-            <div>Rank</div>
-            <div>Candidate</div>
-            <div>Skill</div>
-            <div style={{ textAlign: "right" }}>Score</div>
+            <div>Rank</div><div>Candidate</div><div>Skill</div><div style={{ textAlign:"right" }}>Score</div>
           </div>
-          {ranked.map((r, i) => {
-            const isTopTen = i < topTenCount;
-            const isMe = r.userId === currentUser.id;
-            return (
-              <div
-                key={r.userId}
-                className={`task-lb-row rank-${i + 1} ${isTopTen ? "top-ten" : ""} ${isMe ? "me" : ""}`}
-              >
-                <div className="task-lb-rank">{i < 3 ? ["🥇", "🥈", "🥉"][i] : `#${i + 1}`}</div>
-                <div className="task-lb-name">{r.candidateName}{isMe ? " (You)" : ""}</div>
-                <div className={`skill-badge skill-${r.skillLevel.toLowerCase()}`}>{r.skillLevel}</div>
-                <div className="task-lb-score">{r.totalScore}/40</div>
-              </div>
-            );
-          })}
-          {myRank > 0 && (
-            <div className="muted" style={{ marginTop: 12 }}>Your rank: #{myRank} of {ranked.length}</div>
-          )}
+          {ranked.map((r, i) => (
+            <div key={r.userId}
+              className={`task-lb-row ${i < topN ? "top-ten" : ""} ${r.userId === currentUser.id ? "me" : ""}`}>
+              <div className="task-lb-rank">{i < 3 ? ["🥇","🥈","🥉"][i] : `#${i+1}`}</div>
+              <div className="task-lb-name">{r.candidateName}{r.userId === currentUser.id ? " (You)" : ""}</div>
+              <div className={`skill-badge skill-${r.skillLevel.toLowerCase()}`}>{r.skillLevel}</div>
+              <div className="task-lb-score">{r.totalScore}/40</div>
+            </div>
+          ))}
+          {myRank > 0 && <p className="muted" style={{ marginTop: 12 }}>Your rank: #{myRank} of {ranked.length}</p>}
         </div>
       )}
     </div>
   );
 }
 
-// ─── ASSESSMENT PAGE ──────────────────────────────────────────────────────
-function AssessmentPage({ db, currentUser, setView, notify, logout }) {
-  const existing = db.responses.find(r => r.userId === currentUser.id);
-  const [section, setSection] = useState(0);
-  const [timer, setTimer] = useState(30 * 60);
-  const [answers, setAnswers] = useState(EMPTY_ANSWERS);
-  const [saving, setSaving] = useState(false);
-  const [submitting, setSubmitting] = useState(false);
-  const [submitted, setSubmitted] = useState(false);
-  const autosaveRef = useRef(null);
-  const draftLoadedRef = useRef(false);
-  const answersRef = useRef(answers);
-  const responsesRef = useRef(db.responses);
-
-  useEffect(() => {
-    answersRef.current = answers;
-  }, [answers]);
-
-  useEffect(() => {
-    responsesRef.current = db.responses;
-  }, [db.responses]);
-
-  useEffect(() => {
-    if (existing) { setView("candidate_dashboard"); return; }
-    if (draftLoadedRef.current) return;
-    draftLoadedRef.current = true;
-    const saved = localStorage.getItem(`assessment_draft_${currentUser.id}`);
-    if (saved) {
-      try {
-        setAnswers(a => ({ ...a, ...JSON.parse(saved) }));
-      } catch {
-        localStorage.removeItem(`assessment_draft_${currentUser.id}`);
-      }
-    }
-  }, [existing, currentUser.id, setView]);
-
-  useEffect(() => {
-    autosaveRef.current = setInterval(() => {
-      setSaving(true);
-      localStorage.setItem(`assessment_draft_${currentUser.id}`, JSON.stringify(answers));
-      setTimeout(() => setSaving(false), 1000);
-    }, 30000);
-    return () => clearInterval(autosaveRef.current);
-  }, [answers]);
-
-  useEffect(() => {
-    const t = setInterval(() => setTimer(s => { if (s <= 1) { clearInterval(t); handleSubmit(); return 0; } return s - 1; }), 1000);
-    return () => clearInterval(t);
-  }, []);
-
-  const set = k => e => setAnswers(a => ({ ...a, [k]: e.target.value }));
-  const blockPaste = e => {
-    e.preventDefault();
-    notify("Pasting is disabled during the assessment.", "error");
-  };
-  const textareaSecurityProps = {
-    onPaste: blockPaste,
-    onDrop: blockPaste,
-    onContextMenu: e => e.preventDefault(),
-    autoComplete: "off",
-    spellCheck: false,
-  };
-  const fmt = s => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
-
-  const handleSubmit = async () => {
-    if (submitted || submitting) return;
-    const currentAnswers = answersRef.current;
-    const missing = ANSWER_FIELDS.filter(field => !currentAnswers[field].trim());
-    if (missing.length) return notify("Complete every section before submitting.", "error");
-
-    setSubmitting(true);
-    try {
-      const integrity = analyzeIntegrity(currentAnswers, responsesRef.current, currentUser.id);
-      const aiEvaluation = await evaluateAssessmentWithAI(currentAnswers, integrity.flags);
-      const response = {
-        userId: currentUser.id,
-        answers: currentAnswers,
-        scores: aiEvaluation.scores,
-        totalScore: aiEvaluation.totalScore,
-        skillLevel: aiEvaluation.skillLevel,
-        flags: uniqueList([...integrity.flags, ...aiEvaluation.flags]),
-        integritySignals: integrity.signals,
-        aiEvaluation: {
-          feedback: aiEvaluation.feedback,
-          qualitySignals: aiEvaluation.qualitySignals,
-        },
-        evaluationSource: aiEvaluation.source,
-        submittedAt: serverTimestamp(),
-        submittedAtIso: new Date().toISOString(),
-      };
-
-      await addDoc(collection(firestore, "responses"), response);
-      localStorage.removeItem(`assessment_draft_${currentUser.id}`);
-      setSubmitted(true);
-      notify(aiEvaluation.source === "openai" ? "Assessment submitted and AI-scored." : "Assessment submitted with fallback scoring.");
-      setTimeout(() => setView("candidate_dashboard"), 2500);
-    } catch (error) {
-      notify(error.message || "Could not submit assessment.", "error");
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const sections = [
-    { label: "Audit Prompt", icon: "1" },
-    { label: "Excel Workflow", icon: "2" },
-    { label: "AI Review", icon: "3" },
-    { label: "Prompt Repair", icon: "4" },
-    { label: "Client Deliverable", icon: "5" },
-  ];
-
-  if (submitted) return (
-    <div className="auth-page"><div className="auth-card" style={{ textAlign: "center" }}>
-      <div style={{ fontSize: 64, marginBottom: 16 }}>🎉</div>
-      <h2 className="auth-title">Submitted!</h2>
-      <p className="auth-sub">Your assessment has been scored. Redirecting…</p>
-    </div></div>
-  );
-
-  return (
-    <div className="main-layout">
-      <Sidebar role="candidate" current="assessment" setView={setView} logout={logout} user={currentUser} />
-      <div className="content-area">
-        <div className="page-header">
-          <div>
-            <h2 className="page-title">AI Skills Assessment</h2>
-            <p className="page-sub">Section {section + 1} of 5 • {saving ? "Autosaving…" : "All changes saved"}</p>
-          </div>
-          <div className="assessment-controls">
-            <div className={`timer ${timer < 300 ? "timer-urgent" : ""}`}>⏱ {fmt(timer)}</div>
-          </div>
-        </div>
-
-        {/* Section Navigator */}
-        <div className="section-nav">
-          {sections.map((s, i) => (
-            <button key={i} className={`section-pill ${i === section ? "active" : i < section ? "done" : ""}`}
-              onClick={() => setSection(i)}>
-              <span>{s.icon}</span> {s.label}
-            </button>
-          ))}
-        </div>
-
-        {/* Section Content */}
-        <div className="assessment-card">
-          {section === 0 && (
-            <AssessmentSection
-              title="Section A: Audit Prompt Design" score="10 pts"
-              desc="Write one professional prompt for an AI assistant to review a client's trial balance and financial statements for audit risk. The prompt must define the CA role, required documents, materiality threshold, checks to perform, and the exact output format expected for audit working papers."
-              field="sectionA" val={answers.sectionA} set={set("sectionA")}
-              textareaProps={textareaSecurityProps}
-              placeholder="Act as an Indian statutory audit manager. Review the attached trial balance, ledger extract, and financial statements. Check revenue cut-off, unusual journals, related parties, GST/TDS exposures, ageing, material variances... Return a table with Issue | Evidence | Amount | Risk | Audit Procedure | Client Query."
-              minLen={450}
-            />
-          )}
-          {section === 1 && (
-            <div>
-              <div className="section-header">
-                <h3 className="section-title">Section B: Excel and File Workflow <span className="pts-badge">20 marks</span></h3>
-                <div className="section-desc">
-                  <p><strong>Scenario:</strong> You are given two files: 1. Sales Register (Excel) 2. GSTR-1 data (CSV).</p>
-                  <p><strong>Task:</strong> Explain how you would use an AI tool, such as Claude, along with Excel/CSV data to reconcile these records and identify mismatches.</p>
-                  <p><strong>Note:</strong> Focus on practical workflow. No coding required.</p>
-                </div>
-              </div>
-              {[
-                ["1. Prompt You Would Use", "promptUsed", "Write the exact prompt you would give to the AI to analyze the files. Include fields to compare such as invoice number, date, GSTIN, taxable value, and tax amount."],
-                ["2. Expected Output Format", "claudeOutput", "Describe or show how the AI should return results. Example: a table or CSV with columns like Invoice No, Issue Type, Difference Amount, and Remarks."],
-                ["3. Validation Steps and Final Deliverable", "candidateImprovements", "Explain how you would verify the AI output using Excel, such as formulas, filters, pivot tables, and cross-checking totals. Then explain how you would convert the AI output into a usable report for audit or GST reconciliation."],
-              ].map(([lbl, key, ph]) => (
-                <div className="form-group" key={key}>
-                  <label>{lbl}</label>
-                  <textarea className="form-textarea" rows={6} value={answers[key]}
-                    onChange={set(key)} placeholder={ph} {...textareaSecurityProps} />
-                </div>
-              ))}
-            </div>
-          )}
-          {section === 2 && (
-            <AssessmentSection
-              title="Section C: Review AI Output Quality" score="10 pts"
-              desc={<>Review the AI output below as if you are signing off a working paper. Identify what is wrong, what evidence is missing, and what follow-up instructions you would give before relying on it.<br /><br /><div className="sample-output">"Sales increased by 18% and expenses look normal. GST seems mostly fine. A few invoices may need checking. Overall, there is no major issue, but the client should confirm the numbers."</div></>}
-              field="sectionC" val={answers.sectionC} set={set("sectionC")}
-              textareaProps={textareaSecurityProps}
-              placeholder="This output is not sufficient because it does not cite source files, invoice IDs, materiality, exception amounts, formulas used, or audit procedures. I would ask the AI to..."
-              minLen={350}
-            />
-          )}
-          {section === 3 && (
-            <div>
-              <div className="section-header">
-                <h3 className="section-title">Section D: Prompt Repair <span className="pts-badge">Bonus</span></h3>
-                <p className="section-desc">Rewrite the weak prompt into a specific CA-grade instruction. It must mention input files, checks, expected format, exclusions, and how exceptions should be prioritised.</p>
-              </div>
-              <div className="sample-output weak">
-                <strong>Weak Prompt:</strong> "Check my GST and Excel file and tell me if anything is wrong."
-              </div>
-              <div className="form-group">
-                <label>Your Improved Prompt</label>
-                <textarea className="form-textarea" rows={8} value={answers.sectionD}
-                  onChange={set("sectionD")}
-                  placeholder="Act as a GST reconciliation specialist. Use sales_register.xlsx, GSTR-1.csv, and GSTR-3B.pdf. Match by GSTIN, invoice number, date, taxable value, CGST/SGST/IGST. Flag mismatches above Rs 5,000 or 2%, duplicates, missing invoices, invalid GSTINs, and date-format issues. Return a table plus a CSV-ready exception list..."
-                  {...textareaSecurityProps} />
-              </div>
-            </div>
-          )}
-          {section === 4 && (
-            <AssessmentSection
-              title="Section E: Client Deliverable Prompt" score="Synthesis"
-              desc="Your client is a manufacturing company with Rs 12Cr turnover. Write a prompt that makes AI produce a client-ready GST and audit deliverable. It should include a checklist, Excel-ready reconciliation table, source-document assumptions, and a short management summary."
-              field="sectionE" val={answers.sectionE} set={set("sectionE")}
-              textareaProps={textareaSecurityProps}
-              placeholder="Prepare a professional deliverable for a manufacturing client. Inputs: purchase register, sales register, GSTR-1, GSTR-3B, E-way bill data, fixed asset additions, and previous-year audit points. Output: management summary, compliance checklist, Excel-ready exception table, responsible owner, due date, risk rating, and evidence required."
-              minLen={500}
-            />
-          )}
-        </div>
-
-        {/* Navigation Buttons */}
-        <div className="assessment-nav">
-          <button className="btn-outline" onClick={() => setSection(s => Math.max(0, s - 1))} disabled={section === 0}>
-            ← Previous
-          </button>
-          <div className="progress-dots">
-            {sections.map((_, i) => <div key={i} className={`dot ${i === section ? "active" : i < section ? "done" : ""}`} />)}
-          </div>
-          {section < 4 ? (
-            <button className="btn-primary" onClick={() => setSection(s => s + 1)}>Next →</button>
-          ) : (
-            <button className="btn-submit" onClick={handleSubmit} disabled={submitting}>
-              {submitting ? "Scoring…" : "Submit Assessment ✓"}
-            </button>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function AssessmentSection({ title, score, desc, field, val, set, placeholder, minLen, textareaProps = {} }) {
-  const pct = Math.min(100, Math.round((val.length / minLen) * 100));
-  return (
-    <div>
-      <div className="section-header">
-        <h3 className="section-title">{title} <span className="pts-badge">{score}</span></h3>
-        <p className="section-desc">{desc}</p>
-      </div>
-      <div className="form-group">
-        <label>Your Response</label>
-        <textarea className="form-textarea" rows={9} value={val} onChange={set} placeholder={placeholder} {...textareaProps} />
-        <div className="char-indicator">
-          <div className="char-bar" style={{ width: `${pct}%`, background: pct >= 100 ? "#22c55e" : "#f59e0b" }} />
-        </div>
-        <span className="char-count">{val.length} chars {pct < 100 ? `(aim for ${minLen}+)` : "✓ Good length"}</span>
-      </div>
-    </div>
-  );
-}
-
-// ─── ADMIN DASHBOARD ──────────────────────────────────────────────────────
+// ─── Admin Dashboard ────────────────────────────────────────────────────────
 function AdminDashboard({ db, currentUser, logout, notify }) {
   const [tab, setTab] = useState("overview");
-  const [selectedCandidate, setSelectedCandidate] = useState(null);
-  const [filters, setFilters] = useState({ domain: "All", experience: "All", aiUsage: "All" });
-  const [scoringModal, setScoringModal] = useState(null);
   const [taskForm, setTaskForm] = useState({ title: "", description: "", deadline: "" });
-  const [taskViewer, setTaskViewer] = useState(null);
-  const [taskSubmissionModal, setTaskSubmissionModal] = useState(null);
-  const [taskManualScoreModal, setTaskManualScoreModal] = useState(null);
+  const [scoringModal, setScoringModal] = useState(null);   // task_submission doc
+  const [detailModal, setDetailModal] = useState(null);     // task_submission doc
+  const [taskViewer, setTaskViewer] = useState(null);       // task doc
+  const [lbTaskId, setLbTaskId] = useState("");
 
-  const [adminTaskLeaderboardTaskId, setAdminTaskLeaderboardTaskId] = useState("");
-
-  const responses = db.responses;
   const candidates = db.users.filter(u => u.role === "candidate");
-  const avgScore = responses.length ? Math.round(responses.reduce((a, r) => a + r.totalScore, 0) / responses.length) : 0;
-  const ranked = [...responses].sort((a, b) => b.totalScore - a.totalScore);
-  const topTenCount = ranked.length ? Math.max(1, Math.ceil(ranked.length * 0.1)) : 0;
-  const topTen = ranked.slice(0, topTenCount);
-  const commonMistakes = getCommonMistakes(responses);
+  const allSubs = db.taskSubmissions;
+  const scoredSubs = allSubs.filter(s => s.evaluationSource !== "pending");
+  const avgScore = scoredSubs.length
+    ? Math.round(scoredSubs.reduce((a, s) => a + s.totalScore, 0) / scoredSubs.length) : 0;
 
-  const skillDist = { Beginner: 0, Intermediate: 0, Advanced: 0 };
-  responses.forEach(r => { if (skillDist[r.skillLevel] !== undefined) skillDist[r.skillLevel]++; });
+  const skillDist = { Beginner: 0, Intermediate: 0, Advanced: 0, Pending: 0 };
+  allSubs.forEach(s => { if (s.skillLevel in skillDist) skillDist[s.skillLevel]++; });
 
-  const applyScores = async (responseId, scores) => {
-    const total = scores.promptScore + scores.taskScore + scores.evaluationScore;
+  const saveScores = async (submission, scores, feedback) => {
+    const total = scores.taskScore + scores.evaluationScore;
     const skillLevel = getSkillLevel(total);
+    const user = db.users.find(u => u.id === submission.userId);
+
     try {
-      await updateDoc(doc(firestore, "responses", responseId), {
-        scores,
+      await updateDoc(doc(firestore, "task_submissions", submission.id), {
+        scores: { promptScore: 0, ...scores },
         totalScore: total,
         skillLevel,
-        evaluationSource: "admin_override",
-        reviewedBy: currentUser.id,
-        reviewedAt: serverTimestamp(),
+        feedback: feedback ? [feedback] : [],
+        evaluationSource: "admin",
+        scoredAt: serverTimestamp(),
       });
-      notify("Scores saved successfully!");
+
+      // Update leaderboard entry
+      await setDoc(
+        doc(firestore, "task_leaderboards", submission.taskId, "entries", submission.userId),
+        {
+          taskId: submission.taskId,
+          userId: submission.userId,
+          candidateName: user?.name || "Candidate",
+          totalScore: total,
+          skillLevel,
+          submittedAt: submission.submittedAt,
+          scoredAt: new Date().toISOString(),
+        },
+        { merge: true }
+      );
+
+      notify("Scores saved and leaderboard updated.");
       setScoringModal(null);
-    } catch (error) {
-      notify(error.message || "Could not save scores.", "error");
+    } catch (err) {
+      notify(err.message || "Could not save scores.", "error");
     }
   };
-
-  const filteredResponses = ranked.filter(r => {
-    const user = db.users.find(u => u.id === r.userId);
-    if (!user) return false;
-    if (filters.domain !== "All" && user.domain !== filters.domain) return false;
-    if (filters.experience !== "All" && user.experience !== filters.experience) return false;
-    if (filters.aiUsage !== "All" && user.aiUsage !== filters.aiUsage) return false;
-    return true;
-  });
 
   return (
     <div className="main-layout">
       <Sidebar role="admin" current={tab} setView={setTab} logout={logout} user={currentUser} />
       <div className="content-area">
 
-        {/* Scoring Modal */}
         {scoringModal && (
-          <ScoringModal
-            response={scoringModal}
+          <AdminScoringModal
+            submission={scoringModal}
             user={db.users.find(u => u.id === scoringModal.userId)}
-            onSave={applyScores}
+            task={db.tasks.find(t => t.id === scoringModal.taskId)}
+            onSave={saveScores}
             onClose={() => setScoringModal(null)}
           />
         )}
 
-        {/* Candidate Detail Panel */}
-        {selectedCandidate && (
-          <CandidateDetailPanel
-            response={selectedCandidate}
-            user={db.users.find(u => u.id === selectedCandidate.userId)}
-            onScore={() => setScoringModal(selectedCandidate)}
-            onClose={() => setSelectedCandidate(null)}
+        {detailModal && (
+          <SubmissionDetailModal
+            submission={detailModal}
+            user={db.users.find(u => u.id === detailModal.userId)}
+            task={db.tasks.find(t => t.id === detailModal.taskId)}
+            onScore={() => { setScoringModal(detailModal); setDetailModal(null); }}
+            onClose={() => setDetailModal(null)}
           />
         )}
 
@@ -1827,48 +1028,24 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
           <TaskSubmissionsViewer
             task={taskViewer}
             db={db}
-            onClose={() => { setTaskViewer(null); setTaskSubmissionModal(null); }}
-            onOpenSubmission={setTaskSubmissionModal}
+            onOpenSubmission={s => { setDetailModal(s); setTaskViewer(null); }}
+            onClose={() => setTaskViewer(null)}
           />
         )}
 
-        {taskSubmissionModal && (
-          <TaskSubmissionDetailModal
-            submission={taskSubmissionModal}
-            user={db.users.find(u => u.id === taskSubmissionModal.userId)}
-            task={db.tasks.find(t => t.id === taskSubmissionModal.taskId)}
-            onClose={() => setTaskSubmissionModal(null)}
-            onManualScore={() => setTaskManualScoreModal(taskSubmissionModal)}
-          />
-        )}
-
-        {taskManualScoreModal && (
-          <TaskSubmissionManualScoreModal
-            submission={taskManualScoreModal}
-            user={db.users.find(u => u.id === taskManualScoreModal.userId)}
-            task={db.tasks.find(t => t.id === taskManualScoreModal.taskId)}
-            onClose={() => setTaskManualScoreModal(null)}
-            notify={notify}
-          />
-        )}
-
-        {/* Overview Tab */}
+        {/* ── OVERVIEW ── */}
         {tab === "overview" && (
           <>
             <div className="page-header">
-              <div>
-                <h2 className="page-title">Admin Dashboard</h2>
-                <p className="page-sub">AI Skills Assessment Analytics</p>
-              </div>
+              <div><h2 className="page-title">Admin Dashboard</h2><p className="page-sub">Daily Task Management</p></div>
               <div className="header-badge">Admin</div>
             </div>
-
             <div className="stats-grid">
               {[
-                { label: "Total Candidates", value: candidates.length, icon: "👥", color: "blue" },
-                { label: "Submissions", value: responses.length, icon: "📋", color: "purple" },
-                { label: "Average Score", value: avgScore + "/40", icon: "📊", color: "accent" },
-                { label: "Flagged", value: responses.filter(r => r.flags.length > 0).length, icon: "⚠", color: "red" },
+                { label: "Candidates", value: candidates.length, icon: "👥", color: "blue" },
+                { label: "Total Submissions", value: allSubs.length, icon: "📋", color: "purple" },
+                { label: "Pending Review", value: allSubs.filter(s => s.evaluationSource === "pending").length, icon: "⏳", color: "yellow" },
+                { label: "Avg Score (scored)", value: scoredSubs.length ? avgScore + "/40" : "—", icon: "📊", color: "accent" },
               ].map(s => (
                 <div key={s.label} className={`stat-card stat-${s.color}`}>
                   <div className="stat-icon">{s.icon}</div>
@@ -1877,376 +1054,215 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
                 </div>
               ))}
             </div>
-
-            <div className="card">
-              <h3 className="card-title">Admin Insights</h3>
-              <div className="insight-grid">
-                <div className="insight-panel">
-                  <div className="insight-kicker">Top 10% Candidates</div>
-                  <div className="insight-value">{topTen.length || 0}</div>
-                  <div className="insight-body">
-                    {topTen.length
-                      ? topTen.map(r => db.users.find(u => u.id === r.userId)?.name || "Unknown").join(", ")
-                      : "No submissions yet"}
-                  </div>
-                </div>
-                <div className="insight-panel">
-                  <div className="insight-kicker">Most Common Mistakes</div>
-                  <div className="mistake-list">
-                    {commonMistakes.length
-                      ? commonMistakes.map(item => <span key={item.label}>{item.label} ({item.count})</span>)
-                      : <span>No recurring issues yet</span>}
-                  </div>
-                </div>
-                <div className="insight-panel">
-                  <div className="insight-kicker">Benchmark</div>
-                  <div className="insight-value">{avgScore}/40</div>
-                  <div className="insight-body">Average candidate score across all submitted assessments.</div>
-                </div>
-              </div>
-            </div>
-
             <div className="two-col">
               <div className="card">
-                <h3 className="card-title">Top Performers</h3>
-                <BarChart data={ranked.slice(0, 5).map(r => ({
-                  label: db.users.find(u => u.id === r.userId)?.name?.split(" ")[0] || "?",
-                  value: r.totalScore, max: 40
-                }))} />
-              </div>
-              <div className="card">
-                <h3 className="card-title">Skill Distribution</h3>
+                <h3 className="card-title">Skill Distribution (scored only)</h3>
                 <PieChart data={[
-                  { label: "Beginner", value: skillDist.Beginner, color: "#ef4444" },
-                  { label: "Intermediate", value: skillDist.Intermediate, color: "#f59e0b" },
-                  { label: "Advanced", value: skillDist.Advanced, color: "#22c55e" },
+                  { label: "Beginner", value: skillDist.Beginner, color: "#b42318" },
+                  { label: "Intermediate", value: skillDist.Intermediate, color: "#a15c07" },
+                  { label: "Advanced", value: skillDist.Advanced, color: "#1f7a4d" },
                 ]} />
               </div>
-            </div>
-
-            <div className="card">
-              <h3 className="card-title">Score Distribution</h3>
-              <Histogram data={responses.map(r => r.totalScore)} />
-            </div>
-          </>
-        )}
-
-        {tab === "task_leaderboards" && (
-          <>
-            <div className="page-header">
-              <div>
-                <h2 className="page-title">Task Leaderboards</h2>
-                <p className="page-sub">View per-task rankings for Daily Tasks.</p>
-              </div>
-              <div className="header-badge">Admin</div>
-            </div>
-
-            {!db.tasks.length ? (
-              <div className="empty-state">
-                <div className="empty-icon">🏆</div>
-                <h3>No tasks yet</h3>
-                <p>Create a Daily Task to start collecting submissions.</p>
-              </div>
-            ) : (
               <div className="card">
-                <h3 className="card-title">Select Task</h3>
-                <div className="filter-bar" style={{ marginBottom: 0 }}>
-                  <select
-                    className="filter-select"
-                    value={adminTaskLeaderboardTaskId || ""}
-                    onChange={e => setAdminTaskLeaderboardTaskId(e.target.value)}
-                  >
-                    <option value="">Pick a task…</option>
-                    {db.tasks
-                      .slice()
-                      .sort((a, b) => (b.deadline || "").localeCompare(a.deadline || ""))
-                      .map(t => (
-                        <option key={t.id} value={t.id}>{t.title}</option>
-                      ))}
-                  </select>
+                <h3 className="card-title">Pending Reviews</h3>
+                <div className="pending-list">
+                  {allSubs.filter(s => s.evaluationSource === "pending").slice(0, 8).map(s => {
+                    const user = db.users.find(u => u.id === s.userId);
+                    const task = db.tasks.find(t => t.id === s.taskId);
+                    return (
+                      <div key={s.id} className="pending-row" onClick={() => setDetailModal(s)}>
+                        <div className="pending-info">
+                          <div className="pending-name">{user?.name || "Unknown"}</div>
+                          <div className="pending-task">{task?.title || "Task"}</div>
+                        </div>
+                        <button className="btn-score" onClick={e => { e.stopPropagation(); setScoringModal(s); }}>
+                          Score
+                        </button>
+                      </div>
+                    );
+                  })}
+                  {allSubs.filter(s => s.evaluationSource === "pending").length === 0 && (
+                    <div className="empty-chart">All submissions reviewed ✓</div>
+                  )}
                 </div>
               </div>
-            )}
-
-            {adminTaskLeaderboardTaskId && (
-              <TaskLeaderboard taskId={adminTaskLeaderboardTaskId} currentUser={currentUser} />
-            )}
+            </div>
           </>
         )}
 
-        {/* Candidates Tab */}
-        {tab === "candidates" && (
+        {/* ── SUBMISSIONS ── */}
+        {tab === "submissions" && (
           <>
             <div className="page-header">
-              <div>
-                <h2 className="page-title">Candidate Evaluation</h2>
-                <p className="page-sub">{filteredResponses.length} submissions</p>
+              <div><h2 className="page-title">All Submissions</h2>
+                <p className="page-sub">{allSubs.length} total • {allSubs.filter(s => s.evaluationSource === "pending").length} pending review</p>
               </div>
             </div>
-
-            <div className="filter-bar">
-              {[
-                { key: "domain", opts: ["All", "Audit", "Tax", "Advisory"] },
-                { key: "experience", opts: ["All", "< 1 year", "1-3 years", "3-5 years", "5+ years"] },
-                { key: "aiUsage", opts: ["All", "Beginner", "Intermediate", "Advanced"] },
-              ].map(f => (
-                <select key={f.key} className="filter-select"
-                  value={filters[f.key]} onChange={e => setFilters(flt => ({ ...flt, [f.key]: e.target.value }))}>
-                  {f.opts.map(o => <option key={o}>{o}</option>)}
-                </select>
-              ))}
-            </div>
-
             <div className="candidate-list">
-              {filteredResponses.map((r, i) => {
-                const user = db.users.find(u => u.id === r.userId);
+              {allSubs.map((s, i) => {
+                const user = db.users.find(u => u.id === s.userId);
+                const task = db.tasks.find(t => t.id === s.taskId);
+                const pending = s.evaluationSource === "pending";
                 return (
-                  <div key={r.id} className="candidate-row" onClick={() => setSelectedCandidate(r)}>
-                    <div className="rank-num">#{i + 1}</div>
+                  <div key={s.id} className="candidate-row" onClick={() => setDetailModal(s)}>
+                    <div className="rank-num">#{i+1}</div>
                     <div className="candidate-info">
                       <div className="candidate-name">{user?.name || "Unknown"}</div>
-                      <div className="candidate-meta">{user?.domain} • {user?.experience} • {user?.aiUsage}</div>
+                      <div className="candidate-meta">{task?.title || "Task"} • {new Date(s.submittedAt).toLocaleDateString()}</div>
                     </div>
-                    <div className="candidate-scores">
-                      <span className="score-chip">P:{r.scores.promptScore}/10</span>
-                      <span className="score-chip">T:{r.scores.taskScore}/20</span>
-                      <span className="score-chip">E:{r.scores.evaluationScore}/10</span>
+                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                      {s.files?.map((f, fi) => (
+                        <span key={fi} className="file-type-chip">
+                          {f.type === "video" ? "🎥" : f.type === "image" ? "🖼" : "📄"} {f.type}
+                        </span>
+                      ))}
                     </div>
-                    <div className={`skill-badge skill-${r.skillLevel.toLowerCase()}`}>{r.skillLevel}</div>
-                    <div className="total-score">{r.totalScore}<span>/40</span></div>
-                    {r.flags.length > 0 && <div className="flag-chip">⚠ {r.flags.length}</div>}
-                    <button className="btn-score" onClick={e => { e.stopPropagation(); setScoringModal(r); }}>Score</button>
+                    {pending
+                      ? <span className="pending-chip">⏳ Pending</span>
+                      : <div className={`skill-badge skill-${s.skillLevel.toLowerCase()}`}>{s.skillLevel}</div>}
+                    <div className="total-score">
+                      {pending ? <span style={{ color: "var(--muted)", fontSize: 14 }}>—</span> : <>{s.totalScore}<span>/40</span></>}
+                    </div>
+                    <button className="btn-score"
+                      onClick={e => { e.stopPropagation(); setScoringModal(s); }}>
+                      {pending ? "Score" : "Re-score"}
+                    </button>
                   </div>
                 );
               })}
+              {!allSubs.length && <div className="empty-chart">No submissions yet</div>}
             </div>
           </>
         )}
 
-        {/* Leaderboard Tab */}
-        {tab === "leaderboard" && (
+        {/* ── LEADERBOARDS ── */}
+        {tab === "leaderboards" && (
           <>
             <div className="page-header">
-              <div><h2 className="page-title">Leaderboard</h2><p className="page-sub">Ranked by total score</p></div>
+              <div><h2 className="page-title">Task Leaderboards</h2><p className="page-sub">Admin-scored rankings</p></div>
             </div>
-            <div className="leaderboard">
-              {ranked.map((r, i) => {
-                const user = db.users.find(u => u.id === r.userId);
-                return (
-                  <div key={r.id} className={`leaderboard-row rank-${i + 1}`}>
-                    <div className="lb-rank">{i < 3 ? ["🥇", "🥈", "🥉"][i] : `#${i + 1}`}</div>
-                    <div className="lb-avatar">{user?.name?.[0] || "?"}</div>
-                    <div className="lb-info">
-                      <div className="lb-name">{user?.name}</div>
-                      <div className="lb-meta">{user?.domain} • {user?.experience}</div>
-                    </div>
-                    <div className={`skill-badge skill-${r.skillLevel.toLowerCase()}`}>{r.skillLevel}</div>
-                    <div className="lb-score">
-                      <div className="lb-score-bar" style={{ width: `${(r.totalScore / 40) * 100}%` }} />
-                      <span>{r.totalScore}/40</span>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
+            {db.tasks.length > 0 && (
+              <div className="card" style={{ marginBottom: 20 }}>
+                <select className="filter-select"
+                  value={lbTaskId}
+                  onChange={e => setLbTaskId(e.target.value)}>
+                  <option value="">Select a task…</option>
+                  {db.tasks.slice().sort((a,b) => (b.deadline||"").localeCompare(a.deadline||"")).map(t => (
+                    <option key={t.id} value={t.id}>{t.title}</option>
+                  ))}
+                </select>
+              </div>
+            )}
+            {lbTaskId
+              ? <TaskLeaderboard taskId={lbTaskId} currentUser={currentUser} />
+              : <div className="empty-state"><div className="empty-icon">🏆</div><h3>Pick a task above</h3></div>}
           </>
         )}
 
+        {/* ── TASKS MANAGEMENT ── */}
         {tab === "tasks" && (
           <>
             <div className="page-header">
-              <div><h2 className="page-title">Daily Tasks</h2><p className="page-sub">Create daily tasks, manage status, and track submissions</p></div>
+              <div><h2 className="page-title">Daily Tasks</h2><p className="page-sub">Create and manage tasks</p></div>
             </div>
 
+            {/* Create form */}
             <div className="card">
-              <h3 className="card-title">Create Daily Task</h3>
+              <h3 className="card-title">Create New Task</h3>
               <div className="task-create-grid">
                 <div>
                   <div className="form-group">
                     <label>Title</label>
-                    <input
-                      className="form-input"
-                      value={taskForm.title}
+                    <input className="form-input" value={taskForm.title}
                       onChange={e => setTaskForm(f => ({ ...f, title: e.target.value }))}
-                      placeholder="e.g., GST Reconciliation: Sales Register vs GSTR-1"
-                    />
+                      placeholder="e.g., GST Reconciliation: Sales Register vs GSTR-1" />
                   </div>
-                  <div className="form-group">
-                    <label>Description</label>
-                    <textarea
-                      className="form-textarea"
-                      rows={6}
-                      value={taskForm.description}
+                  <div className="form-group" style={{ marginTop: 12 }}>
+                    <label>Description / Task Brief</label>
+                    <textarea className="form-textarea" rows={6} value={taskForm.description}
                       onChange={e => setTaskForm(f => ({ ...f, description: e.target.value }))}
-                      placeholder="Write a case-based task (audit/GST/Ind AS/reconciliation) with realistic constraints, documents, and expected outputs."
-                    />
+                      placeholder="Write the case scenario. Include files available, checks required, and expected deliverable…" />
                   </div>
                 </div>
                 <div>
                   <div className="form-group">
-                    <label>Deadline</label>
-                    <input
-                      className="form-input datetime-input"
-                      type="datetime-local"
-                      value={taskForm.deadline}
-                      onChange={e => setTaskForm(f => ({ ...f, deadline: e.target.value }))}
-                    />
+                    <label>Submission Deadline</label>
+                    <input className="form-input" type="datetime-local" value={taskForm.deadline}
+                      onChange={e => setTaskForm(f => ({ ...f, deadline: e.target.value }))} />
                   </div>
-                  <button
-                    className="btn-primary"
-                    onClick={async () => {
-                      if (!taskForm.title.trim() || !taskForm.description.trim() || !taskForm.deadline) {
-                        notify("Provide title, description, and deadline.", "error");
-                        return;
-                      }
-                      try {
-                        await addDoc(collection(firestore, "tasks"), {
-                          title: taskForm.title.trim(),
-                          description: taskForm.description.trim(),
-                          deadline: new Date(taskForm.deadline),
-                          active: true,
-                          createdBy: currentUser.id,
-                          createdAt: serverTimestamp(),
-                          submissionCount: 0,
-                        });
-                        setTaskForm({ title: "", description: "", deadline: "" });
-                        notify("Task created.");
-                      } catch (error) {
-                        notify(error.message || "Could not create task.", "error");
-                      }
-                    }}
-                  >
-                    Create Task
-                  </button>
-                  <div className="auth-note" style={{ marginTop: 12 }}>
-                    Tasks appear to all candidates. Candidates can submit once before deadline; submissions are AI-scored and ranked per task.
+                  <div className="auth-note" style={{ marginTop: 12, marginBottom: 16 }}>
+                    Candidates can submit a written response + screen recording (up to 200 MB). Admin reviews and scores manually.
                   </div>
+                  <button className="btn-primary" onClick={async () => {
+                    if (!taskForm.title.trim() || !taskForm.description.trim() || !taskForm.deadline)
+                      return notify("Title, description and deadline are required.", "error");
+                    try {
+                      await addDoc(collection(firestore, "tasks"), {
+                        title: taskForm.title.trim(),
+                        description: taskForm.description.trim(),
+                        deadline: new Date(taskForm.deadline),
+                        active: true,
+                        createdBy: currentUser.id,
+                        createdAt: serverTimestamp(),
+                        submissionCount: 0,
+                      });
+                      setTaskForm({ title: "", description: "", deadline: "" });
+                      notify("Task created.");
+                    } catch (err) {
+                      notify(err.message || "Could not create task.", "error");
+                    }
+                  }}>Create Task</button>
                 </div>
               </div>
             </div>
 
+            {/* Task table */}
             <div className="card">
               <h3 className="card-title">Manage Tasks</h3>
-              {!db.tasks.length ? (
-                <div className="empty-chart">No tasks created yet</div>
-              ) : (
+              {!db.tasks.length ? <div className="empty-chart">No tasks yet</div> : (
                 <div className="task-admin-table">
                   <div className="task-admin-head">
-                    <div>Title</div>
-                    <div>Deadline</div>
-                    <div>Status</div>
-                    <div style={{ textAlign: "right" }}>Submissions</div>
-                    <div style={{ textAlign: "right" }}>Actions</div>
+                    <div>Title</div><div>Deadline</div><div>Status</div>
+                    <div style={{ textAlign:"right" }}>Submissions</div>
+                    <div style={{ textAlign:"right" }}>Actions</div>
                   </div>
-                  {db.tasks
-                    .slice()
-                    .sort((a, b) => (b.deadline || "").localeCompare(a.deadline || ""))
-                    .map(task => {
-                      const deadline = task.deadline ? new Date(task.deadline) : null;
-                      const expired = deadline ? Date.now() > deadline.getTime() : false;
-                      const status = task.active ? (expired ? "Expired" : "Active") : "Inactive";
-                      return (
-                        <div key={task.id} className="task-admin-row">
-                          <div className="task-admin-title">{task.title}</div>
-                          <div className="muted">{deadline ? deadline.toLocaleString() : "N/A"}</div>
-                          <div className={`task-status-pill ${task.active ? (expired ? "expired" : "active") : "inactive"}`}>{status}</div>
-                          <div style={{ textAlign: "right", fontFamily: "'IBM Plex Mono', monospace" }}>{task.submissionCount || 0}</div>
-                          <div style={{ textAlign: "right" }}>
-                            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", flexWrap: "wrap" }}>
-                              <button className="btn-outline sm" onClick={() => setTaskViewer(task)}>View</button>
-                              <button
-                                className="btn-danger sm"
-                                onClick={async () => {
-                                  const ok = window.confirm(
-                                    `Delete this task? This will remove the task, its submissions, and its leaderboard entries.\n\n${task.title}`
-                                  );
-                                  if (!ok) return;
-
-                                  try {
-                                    let batch = writeBatch(firestore);
-                                    let opCount = 0;
-
-                                    const commitAndReset = async () => {
-                                      if (opCount === 0) return;
-                                      await batch.commit();
-                                      batch = writeBatch(firestore);
-                                      opCount = 0;
-                                    };
-
-                                    const queueDelete = ref => {
-                                      batch.delete(ref);
-                                      opCount++;
-                                    };
-
-                                    const subsSnap = await getDocs(
-                                      query(collection(firestore, "task_submissions"), where("taskId", "==", task.id))
-                                    );
-                                    for (const d of subsSnap.docs) {
-                                      queueDelete(d.ref);
-                                      if (opCount >= 450) await commitAndReset();
-                                    }
-
-                                    const lbEntriesSnap = await getDocs(
-                                      collection(firestore, "task_leaderboards", task.id, "entries")
-                                    );
-                                    for (const d of lbEntriesSnap.docs) {
-                                      queueDelete(d.ref);
-                                      if (opCount >= 450) await commitAndReset();
-                                    }
-
-                                    queueDelete(doc(firestore, "task_leaderboards", task.id));
-                                    if (opCount >= 450) await commitAndReset();
-                                    queueDelete(doc(firestore, "tasks", task.id));
-                                    await commitAndReset();
-
-                                    setTaskViewer(v => (v?.id === task.id ? null : v));
-                                    notify("Task deleted.");
-                                  } catch (error) {
-                                    notify(error.message || "Could not delete task.", "error");
-                                  }
-                                }}
-                              >
-                                Delete
-                              </button>
-                              <button
-                                className="btn-outline sm"
-                                onClick={async () => {
-                                  try {
-                                    await updateDoc(doc(firestore, "tasks", task.id), { active: !task.active });
-                                  } catch (error) {
-                                    notify(error.message || "Could not update task.", "error");
-                                  }
-                                }}
-                              >
-                                {task.active ? "Deactivate" : "Activate"}
-                              </button>
-                            </div>
-                          </div>
-                        </div>
-                      );
-                    })}
-                </div>
-              )}
-            </div>
-
-            <div className="card">
-              <h3 className="card-title">Task Submissions (Quick View)</h3>
-              {!db.taskSubmissions.length ? (
-                <div className="empty-chart">No task submissions yet</div>
-              ) : (
-                <div className="candidate-list">
-                  {db.taskSubmissions.slice(0, 20).map((s, i) => {
-                    const user = db.users.find(u => u.id === s.userId);
-                    const task = db.tasks.find(t => t.id === s.taskId);
+                  {db.tasks.slice().sort((a,b) => (b.deadline||"").localeCompare(a.deadline||"")).map(task => {
+                    const deadline = task.deadline ? new Date(task.deadline) : null;
+                    const expired = deadline ? Date.now() > deadline.getTime() : false;
+                    const subCount = db.taskSubmissions.filter(s => s.taskId === task.id).length;
                     return (
-                      <div key={s.id} className="candidate-row" style={{ cursor: "default" }}>
-                        <div className="rank-num">#{i + 1}</div>
-                        <div className="candidate-info">
-                          <div className="candidate-name">{user?.name || "Unknown"}</div>
-                          <div className="candidate-meta">{task?.title || "Task"}</div>
+                      <div key={task.id} className="task-admin-row">
+                        <div className="task-admin-title">{task.title}</div>
+                        <div className="muted">{deadline ? deadline.toLocaleString() : "N/A"}</div>
+                        <div className={`task-status-pill ${task.active ? (expired ? "expired" : "active") : "inactive"}`}>
+                          {task.active ? (expired ? "Expired" : "Active") : "Inactive"}
                         </div>
-                        <div className={`skill-badge skill-${s.skillLevel.toLowerCase()}`}>{s.skillLevel}</div>
-                        <div className="total-score">{s.totalScore}<span>/40</span></div>
+                        <div style={{ textAlign:"right", fontFamily:"'IBM Plex Mono',monospace" }}>{subCount}</div>
+                        <div style={{ textAlign:"right", display:"flex", gap: 8, justifyContent:"flex-end", flexWrap:"wrap" }}>
+                          <button className="btn-outline sm" onClick={() => setTaskViewer(task)}>View</button>
+                          <button className="btn-outline sm" onClick={async () => {
+                            try {
+                              await updateDoc(doc(firestore, "tasks", task.id), { active: !task.active });
+                            } catch (err) { notify(err.message, "error"); }
+                          }}>{task.active ? "Deactivate" : "Activate"}</button>
+                          <button className="btn-danger sm" onClick={async () => {
+                            if (!window.confirm(`Delete "${task.title}"? All submissions and leaderboard entries will be removed.`)) return;
+                            try {
+                              let batch = writeBatch(firestore);
+                              let n = 0;
+                              const flush = async () => { if (n) { await batch.commit(); batch = writeBatch(firestore); n = 0; } };
+                              const del = ref => { batch.delete(ref); n++; };
+                              const subsSnap = await getDocs(query(collection(firestore,"task_submissions"), where("taskId","==",task.id)));
+                              for (const d of subsSnap.docs) { del(d.ref); if (n >= 450) await flush(); }
+                              const lbSnap = await getDocs(collection(firestore,"task_leaderboards",task.id,"entries"));
+                              for (const d of lbSnap.docs) { del(d.ref); if (n >= 450) await flush(); }
+                              del(doc(firestore,"task_leaderboards",task.id));
+                              del(doc(firestore,"tasks",task.id));
+                              await flush();
+                              notify("Task deleted.");
+                            } catch (err) { notify(err.message, "error"); }
+                          }}>Delete</button>
+                        </div>
                       </div>
                     );
                   })}
@@ -2260,131 +1276,237 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
   );
 }
 
-// ─── Scoring Modal ─────────────────────────────────────────────────────────
-function ScoringModal({ response, user, onSave, onClose }) {
-  const [scores, setScores] = useState({ ...response.scores });
-  const total = scores.promptScore + scores.taskScore + scores.evaluationScore;
-  const set = k => e => setScores(s => ({ ...s, [k]: Math.max(0, Math.min(Number(e.target.value), k === "taskScore" ? 20 : 10)) }));
+// ─── Admin Scoring Modal ────────────────────────────────────────────────────
+function AdminScoringModal({ submission, user, task, onSave, onClose }) {
+  const [scores, setScores] = useState({
+    taskScore: submission?.scores?.taskScore ?? 0,
+    evaluationScore: submission?.scores?.evaluationScore ?? 0,
+  });
+  const [feedback, setFeedback] = useState(submission?.feedback?.[0] || "");
+  const [saving, setSaving] = useState(false);
 
-  return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal" onClick={e => e.stopPropagation()}>
-        <div className="modal-header">
-          <h3>Score: {user?.name}</h3>
-          <button className="close-btn" onClick={onClose}>✕</button>
-        </div>
-        <div className="modal-body">
-          {[
-            { label: "Prompt Engineering Score", key: "promptScore", max: 10 },
-            { label: "Task Submission Score", key: "taskScore", max: 20 },
-            { label: "Output Evaluation Score", key: "evaluationScore", max: 10 },
-          ].map(f => (
-            <div key={f.key} className="score-input-row">
-              <label>{f.label} <span className="max-hint">/ {f.max}</span></label>
-              <div className="score-input-wrap">
-                <input type="range" min="0" max={f.max} value={scores[f.key]} onChange={set(f.key)} className="score-range" />
-                <input type="number" min="0" max={f.max} value={scores[f.key]} onChange={set(f.key)} className="score-num" />
-              </div>
-            </div>
-          ))}
-          <div className="total-preview">
-            <span>Total Score</span>
-            <span className="total-num">{total} / 40</span>
-            <span className={`skill-badge skill-${(total < 16 ? "beginner" : total < 28 ? "intermediate" : "advanced")}`}>
-              {total < 16 ? "Beginner" : total < 28 ? "Intermediate" : "Advanced"}
-            </span>
-          </div>
-        </div>
-        <div className="modal-footer">
-          <button className="btn-outline" onClick={onClose}>Cancel</button>
-          <button className="btn-primary" onClick={() => onSave(response.id, scores)}>Save Scores</button>
-        </div>
-      </div>
-    </div>
-  );
-}
+  const total = (Number(scores.taskScore) || 0) + (Number(scores.evaluationScore) || 0);
+  const skillLevel = getSkillLevel(total);
+  const set = k => e => setScores(s => ({ ...s, [k]: clampScore(e.target.value, k === "taskScore" ? 20 : 10) }));
 
-// ─── Candidate Detail Panel ────────────────────────────────────────────────
-function CandidateDetailPanel({ response, user, onScore, onClose }) {
-  const answers = [
-    ["Section A - Audit Prompt Design", response.answers.sectionA],
-    ["Section B - Excel/CSV Prompt", response.answers.promptUsed],
-    ["Section B - AI Output Format", response.answers.claudeOutput],
-    ["Section B - Validation and Improvements", response.answers.candidateImprovements],
-    ["Section C - AI Output Review", response.answers.sectionC],
-    ["Section D - Repaired Prompt", response.answers.sectionD],
-    ["Section E - Client Deliverable Prompt", response.answers.sectionE],
-  ];
+  const handleSave = async () => {
+    setSaving(true);
+    await onSave(submission, scores, feedback);
+    setSaving(false);
+  };
 
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal modal-wide" onClick={e => e.stopPropagation()}>
         <div className="modal-header">
           <div>
-            <h3>{user?.name}'s Submission</h3>
-            <div className="modal-sub">{user?.domain} • {user?.experience} • {user?.aiUsage}</div>
+            <h3>Score Submission</h3>
+            <div className="modal-sub">{user?.name} • {task?.title}</div>
           </div>
-          <div style={{ display: "flex", gap: 8 }}>
-            <button className="btn-primary sm" onClick={onScore}>Score</button>
-            <button className="close-btn" onClick={onClose}>✕</button>
-          </div>
+          <button className="close-btn" onClick={onClose}>✕</button>
         </div>
         <div className="modal-body scrollable">
-          <div className="score-chips-row">
-            <span>Prompt: {response.scores.promptScore}/10</span>
-            <span>Task: {response.scores.taskScore}/20</span>
-            <span>Eval: {response.scores.evaluationScore}/10</span>
-            <span className="total-chip">Total: {response.totalScore}/40</span>
-            <span className={`skill-badge skill-${response.skillLevel.toLowerCase()}`}>{response.skillLevel}</span>
-            <span>Source: {response.evaluationSource.replace(/_/g, " ")}</span>
-            {response.flags.map(f => <span key={f} className="flag-chip">⚠ {f.replace(/_/g, " ")}</span>)}
-          </div>
-          {response.integritySignals.length > 0 && (
-            <div className="answer-item">
-              <div className="answer-label">Integrity Signals</div>
-              <div className="signal-list">
-                {response.integritySignals.map((signal, i) => (
-                  <span key={`${signal.type}-${i}`}>
-                    {signal.type.replace(/_/g, " ")} • {signal.field} • {signal.similarity}% match
-                  </span>
+          {/* Files preview */}
+          {submission.files?.length > 0 && (
+            <div>
+              <div className="answer-label" style={{ marginBottom: 8 }}>Submitted Files</div>
+              <div className="file-list">
+                {submission.files.map((f, i) => (
+                  <div key={i} className="file-item file-done">
+                    <div className="file-icon">{f.type === "video" ? "🎥" : f.type === "image" ? "🖼" : "📄"}</div>
+                    <div className="file-info">
+                      <div className="file-name">{f.name}</div>
+                      <div className="file-meta">{formatBytes(f.size)}</div>
+                    </div>
+                    <a href={f.url} target="_blank" rel="noreferrer" className="file-view-btn">Open ↗</a>
+                  </div>
                 ))}
               </div>
             </div>
           )}
-          {response.aiEvaluation?.feedback?.length > 0 && (
+
+          {/* Text answer */}
+          {submission.textAnswer && (
             <div className="answer-item">
-              <div className="answer-label">AI Feedback</div>
-              <div className="feedback-list">
-                {response.aiEvaluation.feedback.map(item => <div key={item} className="feedback-item">{item}</div>)}
-              </div>
+              <div className="answer-label">Written Response</div>
+              <div className="answer-text">{submission.textAnswer}</div>
             </div>
           )}
-          {answers.map(([lbl, val]) => (
-            <div key={lbl} className="answer-item">
-              <div className="answer-label">{lbl}</div>
-              <div className="answer-text">{val || <em style={{ opacity: 0.4 }}>No response</em>}</div>
+
+          {/* Scoring */}
+          {[
+            { label: "Task Completion Score", key: "taskScore", max: 20, hint: "Quality, correctness, depth of work" },
+            { label: "Evaluation / Critical Thinking", key: "evaluationScore", max: 10, hint: "Self-awareness, error identification, improvements" },
+          ].map(f => (
+            <div key={f.key} className="score-input-row">
+              <label>{f.label} <span className="max-hint">/ {f.max}</span></label>
+              <div className="score-hint">{f.hint}</div>
+              <div className="score-input-wrap">
+                <input type="range" min="0" max={f.max} value={scores[f.key]} onChange={set(f.key)} className="score-range" />
+                <input type="number" min="0" max={f.max} value={scores[f.key]} onChange={set(f.key)} className="score-num" />
+              </div>
             </div>
           ))}
+
+          <div className="total-preview">
+            <span>Total Score</span>
+            <span className="total-num">{total} / 40</span>
+            <span className={`skill-badge skill-${skillLevel.toLowerCase()}`}>{skillLevel}</span>
+          </div>
+
+          <div className="form-group">
+            <label>Feedback for Candidate (optional)</label>
+            <textarea className="form-textarea" rows={4} value={feedback}
+              onChange={e => setFeedback(e.target.value)}
+              placeholder="Describe what was done well and what could be improved…" />
+          </div>
+        </div>
+        <div className="modal-footer">
+          <button className="btn-outline" onClick={onClose} disabled={saving}>Cancel</button>
+          <button className="btn-primary" onClick={handleSave} disabled={saving}>
+            {saving ? "Saving…" : "Save & Update Leaderboard"}
+          </button>
         </div>
       </div>
     </div>
   );
 }
 
-// ─── SIDEBAR ──────────────────────────────────────────────────────────────
+// ─── Submission Detail Modal ────────────────────────────────────────────────
+function SubmissionDetailModal({ submission, user, task, onScore, onClose }) {
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal modal-wide" onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <div>
+            <h3>{user?.name}'s Submission</h3>
+            <div className="modal-sub">{task?.title} • {submission.submittedAt ? new Date(submission.submittedAt).toLocaleString() : ""}</div>
+          </div>
+          <div style={{ display:"flex", gap:8 }}>
+            <button className="btn-primary sm" onClick={onScore}>
+              {submission.evaluationSource === "pending" ? "Score" : "Re-score"}
+            </button>
+            <button className="close-btn" onClick={onClose}>✕</button>
+          </div>
+        </div>
+        <div className="modal-body scrollable">
+          <div className="score-chips-row">
+            {submission.evaluationSource === "pending"
+              ? <span className="pending-chip">⏳ Awaiting review</span>
+              : <>
+                  <span>Task: {submission.scores.taskScore}/20</span>
+                  <span>Eval: {submission.scores.evaluationScore}/10</span>
+                  <span className="total-chip">Total: {submission.totalScore}/40</span>
+                  <span className={`skill-badge skill-${submission.skillLevel.toLowerCase()}`}>{submission.skillLevel}</span>
+                  <span>Source: admin</span>
+                </>}
+          </div>
+
+          {submission.feedback?.length > 0 && (
+            <div className="answer-item">
+              <div className="answer-label">Admin Feedback</div>
+              <div className="feedback-list">
+                {submission.feedback.map((item, i) => <div key={i} className="feedback-item">{item}</div>)}
+              </div>
+            </div>
+          )}
+
+          {submission.files?.length > 0 && (
+            <div>
+              <div className="answer-label" style={{ marginBottom: 8 }}>Submitted Files</div>
+              <div className="file-list">
+                {submission.files.map((f, i) => (
+                  <div key={i} className="file-item file-done">
+                    <div className="file-icon">{f.type === "video" ? "🎥" : f.type === "image" ? "🖼" : "📄"}</div>
+                    <div className="file-info">
+                      <div className="file-name">{f.name}</div>
+                      <div className="file-meta">{formatBytes(f.size)}</div>
+                    </div>
+                    <a href={f.url} target="_blank" rel="noreferrer" className="file-view-btn">Open ↗</a>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {submission.textAnswer && (
+            <div className="answer-item">
+              <div className="answer-label">Written Response</div>
+              <div className="answer-text">{submission.textAnswer}</div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Task Submissions Viewer (admin) ───────────────────────────────────────
+function TaskSubmissionsViewer({ task, db, onOpenSubmission, onClose }) {
+  const subs = db.taskSubmissions.filter(s => s.taskId === task.id)
+    .slice().sort((a, b) => b.totalScore - a.totalScore);
+  const topN = subs.length ? Math.max(1, Math.ceil(subs.length * 0.1)) : 0;
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal modal-wide" onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <div>
+            <h3>{task.title}</h3>
+            <div className="modal-sub">{subs.length} submissions</div>
+          </div>
+          <button className="close-btn" onClick={onClose}>✕</button>
+        </div>
+        <div className="modal-body scrollable">
+          {!subs.length ? <div className="empty-chart">No submissions yet</div> : (
+            <div className="task-admin-table">
+              <div className="task-admin-head" style={{ gridTemplateColumns:"0.5fr 1.6fr 0.8fr 0.5fr 0.5fr" }}>
+                <div>Rank</div><div>Candidate</div><div>Skill</div>
+                <div style={{ textAlign:"right" }}>Score</div><div style={{ textAlign:"right" }}>Open</div>
+              </div>
+              {subs.map((s, i) => {
+                const user = db.users.find(u => u.id === s.userId);
+                return (
+                  <div key={s.id} className="task-admin-row"
+                    style={{
+                      gridTemplateColumns:"0.5fr 1.6fr 0.8fr 0.5fr 0.5fr", cursor:"pointer",
+                      borderColor: i < topN ? "rgba(34,197,94,0.25)" : undefined,
+                      background: i < topN ? "rgba(236,253,245,0.75)" : undefined,
+                    }}
+                    onClick={() => onOpenSubmission(s)}>
+                    <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontWeight:900 }}>
+                      {i < 3 ? ["🥇","🥈","🥉"][i] : `#${i+1}`}
+                    </div>
+                    <div className="task-admin-title">{user?.name || "Unknown"}</div>
+                    <div className={`skill-badge skill-${s.skillLevel.toLowerCase()}`}>{s.skillLevel}</div>
+                    <div style={{ textAlign:"right", fontFamily:"'IBM Plex Mono',monospace", fontWeight:900 }}>
+                      {s.evaluationSource === "pending" ? "—" : `${s.totalScore}/40`}
+                    </div>
+                    <div style={{ textAlign:"right" }}>
+                      <button className="btn-primary sm" onClick={e => { e.stopPropagation(); onOpenSubmission(s); }}>Open</button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Sidebar ───────────────────────────────────────────────────────────────
 function Sidebar({ role, current, setView, logout, user }) {
   const candidateLinks = [
-    { id: "candidate_dashboard", label: "Dashboard", icon: "⊞" },
-    { id: "assessment", label: "Assessment", icon: "✎" },
     { id: "daily_tasks", label: "Daily Tasks", icon: "🗓" },
-    { id: "daily_task_leaderboards", label: "Task Leaderboards", icon: "🏆" },
+    { id: "leaderboards", label: "Leaderboards", icon: "🏆" },
   ];
   const adminLinks = [
     { id: "overview", label: "Overview", icon: "⊞" },
-    { id: "candidates", label: "Candidates", icon: "👥" },
-    { id: "leaderboard", label: "Assessment Leaderboard", icon: "🏆" },
-    { id: "task_leaderboards", label: "Task Leaderboards", icon: "📋" },
-    { id: "tasks", label: "Daily Tasks", icon: "🗓" },
+    { id: "submissions", label: "Submissions", icon: "📋" },
+    { id: "leaderboards", label: "Leaderboards", icon: "🏆" },
+    { id: "tasks", label: "Manage Tasks", icon: "🗓" },
   ];
   const links = role === "admin" ? adminLinks : candidateLinks;
 
@@ -2392,10 +1514,7 @@ function Sidebar({ role, current, setView, logout, user }) {
     <div className="sidebar">
       <div className="sidebar-logo">
         <div className="logo-icon sm">CA</div>
-        <div>
-          <div className="sidebar-brand">AI Skills</div>
-          <div className="sidebar-sub">Assessment</div>
-        </div>
+        <div><div className="sidebar-brand">Task Platform</div><div className="sidebar-sub">Daily CA Tasks</div></div>
       </div>
       <nav className="sidebar-nav">
         {links.map(l => (
@@ -2407,317 +1526,123 @@ function Sidebar({ role, current, setView, logout, user }) {
       <div className="sidebar-footer">
         <div className="sidebar-user">
           <div className="user-avatar">{user?.name?.[0]}</div>
-          <div>
-            <div className="user-name">{user?.name}</div>
-            <div className="user-role">{user?.role}</div>
-          </div>
+          <div><div className="user-name">{user?.name}</div><div className="user-role">{user?.role}</div></div>
         </div>
-        <button className="logout-btn" onClick={logout}>↩</button>
+        <button className="logout-btn" onClick={logout} title="Sign out">↩</button>
       </div>
     </div>
   );
 }
 
-// ─── CHART COMPONENTS ──────────────────────────────────────────────────────
-function BarChart({ data }) {
-  const max = Math.max(...data.map(d => d.value), 1);
-  return (
-    <div className="bar-chart">
-      {data.map((d, i) => (
-        <div key={i} className="bar-item">
-          <div className="bar-wrap">
-            <div className="bar-fill" style={{ height: `${(d.value / 40) * 100}%` }}>
-              <span className="bar-val">{d.value}</span>
-            </div>
-          </div>
-          <div className="bar-label">{d.label}</div>
-        </div>
-      ))}
-    </div>
-  );
-}
-
+// ─── Charts ────────────────────────────────────────────────────────────────
 function PieChart({ data }) {
   const total = data.reduce((a, d) => a + d.value, 0) || 1;
   let cum = 0;
   const slices = data.map(d => {
-    const pct = d.value / total;
-    const start = cum;
-    cum += pct;
+    const pct = d.value / total; const start = cum; cum += pct;
     return { ...d, start, pct };
   });
-
-  const slice = (start, pct, color) => {
+  const slice = (start, pct) => {
     const r = 80, cx = 100, cy = 100;
     const a1 = (start * 360 - 90) * Math.PI / 180;
     const a2 = ((start + pct) * 360 - 90) * Math.PI / 180;
-    const x1 = cx + r * Math.cos(a1), y1 = cy + r * Math.sin(a1);
-    const x2 = cx + r * Math.cos(a2), y2 = cy + r * Math.sin(a2);
-    const large = pct > 0.5 ? 1 : 0;
-    return `M${cx},${cy} L${x1},${y1} A${r},${r} 0 ${large},1 ${x2},${y2} Z`;
+    return `M${cx},${cy} L${cx + r * Math.cos(a1)},${cy + r * Math.sin(a1)} A${r},${r} 0 ${pct > 0.5 ? 1 : 0},1 ${cx + r * Math.cos(a2)},${cy + r * Math.sin(a2)} Z`;
   };
-
   return (
     <div className="pie-chart-wrap">
       <svg viewBox="0 0 200 200" className="pie-svg">
-        {slices.map((s, i) => s.pct > 0 && (
-          <path key={i} d={slice(s.start, s.pct, s.color)} fill={s.color} opacity={0.85} />
-        ))}
+        {slices.map((s, i) => s.pct > 0 && <path key={i} d={slice(s.start, s.pct)} fill={s.color} opacity={0.85} />)}
         <circle cx="100" cy="100" r="50" fill="var(--card)" />
-        <text x="100" y="105" textAnchor="middle" fontSize="20" fill="var(--text)" fontWeight="700">{total}</text>
+        <text x="100" y="105" textAnchor="middle" fontSize="20" fill="var(--text)" fontWeight="700">{data.reduce((a,d)=>a+d.value,0)}</text>
       </svg>
       <div className="pie-legend">
         {data.map(d => (
           <div key={d.label} className="legend-item">
             <div className="legend-dot" style={{ background: d.color }} />
-            <span>{d.label}</span>
-            <span className="legend-val">{d.value}</span>
+            <span>{d.label}</span><span className="legend-val">{d.value}</span>
           </div>
         ))}
       </div>
     </div>
   );
-}
-
-function Histogram({ data }) {
-  if (!data.length) return <div className="empty-chart">No data yet</div>;
-  const buckets = [0, 8, 16, 24, 32, 40];
-  const counts = buckets.slice(0, -1).map((b, i) => ({
-    label: `${b}–${buckets[i + 1]}`,
-    count: data.filter(v => v >= b && v < buckets[i + 1]).length
-  }));
-  const max = Math.max(...counts.map(c => c.count), 1);
-  return (
-    <div className="histogram">
-      {counts.map((b, i) => (
-        <div key={i} className="hist-col">
-          <div className="hist-bar-wrap">
-            <div className="hist-bar" style={{ height: `${(b.count / max) * 100}%` }}>
-              {b.count > 0 && <span className="hist-val">{b.count}</span>}
-            </div>
-          </div>
-          <div className="hist-label">{b.label}</div>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function PercentileRing({ score, max }) {
-  const pct = score / max;
-  const r = 54, cx = 70, cy = 70;
-  const circ = 2 * Math.PI * r;
-  const dash = pct * circ;
-  return (
-    <div className="ring-wrap">
-      <svg viewBox="0 0 140 140" className="ring-svg">
-        <circle cx={cx} cy={cy} r={r} fill="none" stroke="var(--border)" strokeWidth="12" />
-        <circle cx={cx} cy={cy} r={r} fill="none" stroke="var(--accent)" strokeWidth="12"
-          strokeDasharray={`${dash} ${circ}`} strokeLinecap="round"
-          transform={`rotate(-90 ${cx} ${cy})`} />
-        <text x={cx} y={cy - 6} textAnchor="middle" fontSize="22" fontWeight="800" fill="var(--text)">{score}</text>
-        <text x={cx} y={cy + 14} textAnchor="middle" fontSize="10" fill="var(--muted)">out of {max}</text>
-      </svg>
-    </div>
-  );
-}
-
-// ─── Helpers ───────────────────────────────────────────────────────────────
-function skillColor(level) {
-  return { Beginner: "red", Intermediate: "yellow", Advanced: "green" }[level] || "blue";
-}
-
-function getCommonMistakes(responses) {
-  const counts = new Map();
-  const add = label => counts.set(label, (counts.get(label) || 0) + 1);
-
-  responses.forEach(response => {
-    response.flags.forEach(flag => add(flag.replace(/_/g, " ")));
-    if (response.scores.promptScore < 6) add("weak prompt structure");
-    if (response.scores.taskScore < 10) add("thin Excel or AI workflow evidence");
-    if (response.scores.evaluationScore < 6) add("shallow output critique");
-  });
-
-  return [...counts.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 4)
-    .map(([label, count]) => ({ label, count }));
-}
-
-function escapeHtml(value = "") {
-  return String(value)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
-}
-
-function printCandidateReport(user, response, avgScore, rank, totalCandidates) {
-  const feedback = response.aiEvaluation?.feedback?.length
-    ? response.aiEvaluation.feedback.map(item => `<li>${escapeHtml(item)}</li>`).join("")
-    : "<li>No AI feedback stored.</li>";
-  const report = window.open("", "_blank", "width=900,height=1200");
-  if (!report) return;
-
-  report.document.write(`
-    <html>
-      <head>
-        <title>${escapeHtml(user.name)} - AI Skills Report</title>
-        <style>
-          body { font-family: Arial, sans-serif; color: #111827; padding: 40px; line-height: 1.5; }
-          h1 { margin: 0 0 4px; font-size: 28px; }
-          h2 { margin-top: 28px; font-size: 16px; text-transform: uppercase; letter-spacing: .08em; color: #173b63; }
-          .muted { color: #6b7280; }
-          .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 24px 0; }
-          .box { border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; }
-          .label { font-size: 11px; text-transform: uppercase; color: #6b7280; margin-bottom: 6px; }
-          .value { font-size: 24px; font-weight: 800; }
-          pre { white-space: pre-wrap; background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 10px; padding: 14px; font-size: 13px; }
-          @media print { button { display: none; } body { padding: 24px; } }
-        </style>
-      </head>
-      <body>
-        <button onclick="window.print()">Print / Save as PDF</button>
-        <h1>AI Skills Assessment Report</h1>
-        <div class="muted">${escapeHtml(user.name)} • ${escapeHtml(user.email)} • ${escapeHtml(user.domain)} • ${escapeHtml(user.experience)}</div>
-        <div class="grid">
-          <div class="box"><div class="label">Total Score</div><div class="value">${response.totalScore}/40</div></div>
-          <div class="box"><div class="label">Skill Level</div><div class="value">${escapeHtml(response.skillLevel)}</div></div>
-          <div class="box"><div class="label">Rank</div><div class="value">#${rank || "-"}/${totalCandidates || "-"}</div></div>
-          <div class="box"><div class="label">Average</div><div class="value">${avgScore}/40</div></div>
-        </div>
-        <h2>Score Breakdown</h2>
-        <p>Prompt Engineering: ${response.scores.promptScore}/10<br />Task Submission: ${response.scores.taskScore}/20<br />Output Evaluation: ${response.scores.evaluationScore}/10</p>
-        <h2>Evaluator Feedback</h2>
-        <ul>${feedback}</ul>
-        <h2>Flags</h2>
-        <p>${response.flags.length ? escapeHtml(response.flags.map(flag => flag.replace(/_/g, " ")).join(", ")) : "No integrity flags."}</p>
-        <h2>Submitted Prompt</h2>
-        <pre>${escapeHtml(response.answers.sectionA)}</pre>
-      </body>
-    </html>
-  `);
-  report.document.close();
-  report.focus();
-  report.print();
 }
 
 // ─── CSS ───────────────────────────────────────────────────────────────────
 function CSS() {
   return `
     @import url('https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
-
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
     :root {
-      --bg: #f5f7fb;
-      --surface: #ffffff;
-      --card: #ffffff;
-      --subtle: #f8fafc;
-      --border: #d9e1ec;
-      --border-strong: #b7c3d4;
-      --text: #142033;
-      --muted: #66758a;
-      --accent: #173b63;
-      --accent2: #2f5f8f;
-      --green: #1f7a4d;
-      --red: #b42318;
-      --yellow: #a15c07;
-      --blue: #245b91;
-      --shadow: 0 12px 30px rgba(20, 32, 51, 0.08);
+      --bg: #f5f7fb; --surface: #ffffff; --card: #ffffff; --subtle: #f8fafc;
+      --border: #d9e1ec; --border-strong: #b7c3d4; --text: #142033; --muted: #66758a;
+      --accent: #173b63; --accent2: #2f5f8f; --green: #1f7a4d; --red: #b42318;
+      --yellow: #a15c07; --blue: #245b91; --shadow: 0 12px 30px rgba(20,32,51,0.08);
     }
-
     body { background: var(--bg); color: var(--text); font-family: 'Source Sans 3', sans-serif; font-size: 16px; }
-    .app-root { min-height: 100vh; background: var(--bg); }
+    .app-root { min-height: 100vh; }
 
-    /* Toast */
-    .toast { position: fixed; top: 20px; right: 20px; z-index: 9999; padding: 14px 20px; border-radius: 12px; display: flex; align-items: center; gap: 10px; font-size: 14px; font-weight: 600; box-shadow: 0 8px 32px rgba(0,0,0,0.3); animation: slideIn .3s ease; }
-    .toast-success { background: #166534; color: #bbf7d0; border: 1px solid #22c55e40; }
-    .toast-error { background: #7f1d1d; color: #fecaca; border: 1px solid #ef444440; }
-    .toast-info { background: #1e3a8a; color: #bfdbfe; border: 1px solid #3b82f640; }
-    @keyframes slideIn { from { transform: translateX(100px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+    .toast { position: fixed; top: 20px; right: 20px; z-index: 9999; padding: 14px 20px; border-radius: 12px; display: flex; align-items: center; gap: 10px; font-size: 14px; font-weight: 600; box-shadow: 0 8px 32px rgba(0,0,0,0.3); animation: slideIn .3s ease; max-width: 360px; }
+    .toast-success { background: #166534; color: #bbf7d0; }
+    .toast-error { background: #7f1d1d; color: #fecaca; }
+    .toast-info { background: #1e3a8a; color: #bfdbfe; }
+    @keyframes slideIn { from { transform: translateX(120px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
 
-    /* AUTH PAGES */
-    .auth-page { min-height: 100vh; display: flex; align-items: stretch; background: var(--bg); }
-    .auth-card { width: 480px; min-width: 380px; padding: 48px 40px; display: flex; flex-direction: column; gap: 18px; background: var(--surface); border-right: 1px solid var(--border); justify-content: center; }
-    .auth-card.wide { width: 560px; }
+    /* Auth */
+    .auth-page { min-height: 100vh; display: flex; align-items: stretch; }
+    .auth-card { width: 460px; min-width: 340px; padding: 48px 40px; display: flex; flex-direction: column; gap: 18px; background: var(--surface); border-right: 1px solid var(--border); justify-content: center; }
+    .auth-card.wide { width: 540px; }
     .auth-logo { display: flex; align-items: center; gap: 16px; margin-bottom: 8px; }
-    .logo-icon { width: 48px; height: 48px; border-radius: 10px; background: var(--accent); display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 14px; color: #fff; letter-spacing: 1px; }
-    .logo-icon.sm { width: 36px; height: 36px; font-size: 11px; border-radius: 10px; flex-shrink: 0; }
-    .auth-title { font-size: 26px; font-weight: 800; color: var(--text); letter-spacing: -0.02em; }
-    .auth-sub { font-size: 14px; color: var(--muted); margin-top: 2px; font-family: 'IBM Plex Mono', monospace; }
-
-    .auth-hero { flex: 1; padding: 60px; display: flex; flex-direction: column; justify-content: center; background: #eef3f8; position: relative; overflow: hidden; border-left: 1px solid var(--border); }
-    .auth-hero::before { display: none; }
-    .hero-stats { display: flex; gap: 32px; margin-bottom: 40px; }
-    .hero-stat-val { font-size: 36px; font-weight: 800; color: var(--accent); }
-    .hero-stat-lbl { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin-top: 2px; }
-    .hero-heading { font-size: 42px; font-weight: 800; line-height: 1.15; margin-bottom: 16px; letter-spacing: -0.03em; }
-    .hero-body { font-size: 17px; line-height: 1.7; color: var(--muted); max-width: 520px; margin-bottom: 32px; }
+    .logo-icon { width: 48px; height: 48px; border-radius: 10px; background: var(--accent); display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 14px; color: #fff; }
+    .logo-icon.sm { width: 36px; height: 36px; font-size: 11px; flex-shrink: 0; }
+    .auth-title { font-size: 24px; font-weight: 800; color: var(--text); }
+    .auth-sub { font-size: 13px; color: var(--muted); font-family: 'IBM Plex Mono', monospace; }
+    .auth-hero { flex: 1; padding: 60px; display: flex; flex-direction: column; justify-content: center; background: #eef3f8; border-left: 1px solid var(--border); }
+    .hero-heading { font-size: 40px; font-weight: 800; line-height: 1.15; margin-bottom: 16px; letter-spacing: -0.03em; }
+    .hero-body { font-size: 17px; line-height: 1.7; color: var(--muted); margin-bottom: 32px; max-width: 480px; }
     .hero-tags { display: flex; flex-wrap: wrap; gap: 8px; }
-    .hero-tag { padding: 6px 14px; border-radius: 999px; background: #ffffff; border: 1px solid var(--border); font-size: 13px; color: var(--accent); font-weight: 700; }
+    .hero-tag { padding: 6px 14px; border-radius: 999px; background: #fff; border: 1px solid var(--border); font-size: 13px; color: var(--accent); font-weight: 700; }
 
     /* Forms */
     .form-group { display: flex; flex-direction: column; gap: 8px; }
     .form-group label { font-size: 13px; font-weight: 800; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
-    .form-input { background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; color: var(--text); font-size: 16px; font-family: 'Source Sans 3', sans-serif; transition: border .2s, box-shadow .2s; outline: none; }
-    .form-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(23,59,99,0.12); }
-    .form-textarea { background: #fff; border: 1px solid var(--border-strong); border-radius: 10px; padding: 18px; color: var(--text); font-size: 17px; font-family: 'Source Sans 3', sans-serif; resize: vertical; outline: none; transition: border .2s, box-shadow .2s; line-height: 1.65; min-height: 180px; width: 100%; }
-    .form-textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(23,59,99,0.12); }
+    .form-input { background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; color: var(--text); font-size: 16px; font-family: 'Source Sans 3', sans-serif; outline: none; transition: border .2s; }
+    .form-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(23,59,99,0.1); }
+    .form-textarea { background: #fff; border: 1px solid var(--border-strong); border-radius: 10px; padding: 16px; color: var(--text); font-size: 16px; font-family: 'Source Sans 3', sans-serif; resize: vertical; outline: none; transition: border .2s; line-height: 1.65; width: 100%; }
+    .form-textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(23,59,99,0.1); }
     .form-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
 
     /* Buttons */
-    .btn-primary { padding: 12px 22px; background: var(--accent); color: #fff; border: 1px solid var(--accent); border-radius: 8px; font-weight: 800; font-size: 15px; cursor: pointer; font-family: 'Source Sans 3', sans-serif; display: flex; align-items: center; justify-content: center; gap: 8px; transition: background .2s, transform .1s; }
-    .btn-primary:hover { opacity: .9; transform: translateY(-1px); }
+    .btn-primary { padding: 12px 20px; background: var(--accent); color: #fff; border: none; border-radius: 8px; font-weight: 800; font-size: 15px; cursor: pointer; font-family: 'Source Sans 3', sans-serif; display: flex; align-items: center; justify-content: center; gap: 8px; transition: opacity .2s; }
+    .btn-primary:hover { opacity: .88; }
     .btn-primary:disabled { opacity: .5; cursor: not-allowed; }
-    .btn-primary.sm { padding: 8px 16px; font-size: 14px; }
-    .btn-outline { padding: 11px 20px; border: 1px solid var(--border-strong); background: #fff; color: var(--accent); border-radius: 8px; font-weight: 800; font-size: 15px; cursor: pointer; font-family: 'Source Sans 3', sans-serif; transition: background .2s, border-color .2s; }
-    .btn-outline:hover { background: #eef3f8; border-color: var(--accent); }
-    .btn-outline.sm { padding: 7px 14px; font-size: 13px; }
-    .btn-submit { padding: 13px 28px; background: var(--green); color: #fff; border: 1px solid var(--green); border-radius: 8px; font-weight: 800; font-size: 15px; cursor: pointer; font-family: 'Source Sans 3', sans-serif; }
+    .btn-primary.sm { padding: 8px 14px; font-size: 13px; }
+    .btn-outline { padding: 11px 20px; border: 1px solid var(--border-strong); background: #fff; color: var(--accent); border-radius: 8px; font-weight: 800; font-size: 15px; cursor: pointer; font-family: 'Source Sans 3', sans-serif; transition: background .2s; }
+    .btn-outline:hover { background: #eef3f8; }
+    .btn-outline.sm { padding: 7px 12px; font-size: 13px; }
+    .btn-submit { padding: 13px 28px; background: var(--green); color: #fff; border: none; border-radius: 8px; font-weight: 800; font-size: 15px; cursor: pointer; font-family: 'Source Sans 3', sans-serif; }
     .btn-submit:disabled { opacity: .6; cursor: not-allowed; }
-    .btn-danger { padding: 11px 20px; border: 1px solid rgba(180, 35, 24, 0.35); background: #fff; color: var(--red); border-radius: 8px; font-weight: 900; font-size: 15px; cursor: pointer; font-family: 'Source Sans 3', sans-serif; transition: background .2s, border-color .2s; }
-    .btn-danger:hover { background: rgba(180, 35, 24, 0.06); border-color: rgba(180, 35, 24, 0.55); }
-    .btn-danger.sm { padding: 7px 14px; font-size: 13px; }
+    .btn-danger { padding: 7px 12px; border: 1px solid rgba(180,35,24,0.35); background: #fff; color: var(--red); border-radius: 8px; font-weight: 800; font-size: 13px; cursor: pointer; font-family: 'Source Sans 3', sans-serif; }
     .btn-score { padding: 6px 14px; background: var(--accent); color: #fff; border: none; border-radius: 8px; font-size: 13px; font-weight: 800; cursor: pointer; font-family: 'Source Sans 3', sans-serif; white-space: nowrap; }
 
-    /* Spinner */
     .spinner { width: 18px; height: 18px; border: 2px solid rgba(255,255,255,.3); border-top-color: #fff; border-radius: 50%; animation: spin .7s linear infinite; }
-    .spinner.dark { border-color: rgba(99,102,241,.2); border-top-color: var(--accent); margin: 0 auto; }
+    .spinner.dark { border-color: rgba(23,59,99,.2); border-top-color: var(--accent); margin: 0 auto; }
     @keyframes spin { to { transform: rotate(360deg); } }
 
-    /* Divider */
-    .divider { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 12px; }
-    .divider::before, .divider::after { content: ''; flex: 1; height: 1px; background: var(--border); }
-
-    /* Demo buttons */
-    .demo-grid { display: flex; flex-direction: column; gap: 8px; }
-    .demo-btn { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 11px 16px; cursor: pointer; display: flex; align-items: center; gap: 12px; font-family: 'Source Sans 3', sans-serif; color: var(--text); font-size: 14px; text-align: left; transition: border-color .2s; }
-    .demo-btn:hover { border-color: var(--accent); }
-    .demo-email { color: var(--muted); font-family: 'IBM Plex Mono', monospace; font-size: 12px; }
-    .role-badge { padding: 3px 8px; border-radius: 6px; font-size: 11px; font-weight: 700; }
-    .role-badge.candidate { background: #eef3f8; color: var(--accent); }
-    .role-badge.admin { background: #fff1f0; color: var(--red); }
-    .auth-note, .setup-box { background: var(--bg); border: 1px solid var(--border); border-radius: 12px; padding: 14px; color: var(--muted); font-size: 12px; line-height: 1.7; }
-    .auth-note code, .setup-box code { color: var(--accent); font-family: 'IBM Plex Mono', monospace; font-size: 11px; }
-    .setup-box { display: flex; flex-direction: column; gap: 8px; }
-
-    /* Auth link */
     .auth-link { text-align: center; font-size: 13px; color: var(--muted); }
     .auth-link button { background: none; border: none; color: var(--accent); cursor: pointer; font-family: 'Source Sans 3', sans-serif; font-weight: 800; }
-    .back-btn { background: none; border: none; color: var(--accent); cursor: pointer; font-family: 'Source Sans 3', sans-serif; font-size: 14px; font-weight: 800; align-self: flex-start; }
+    .back-btn { background: none; border: none; color: var(--accent); cursor: pointer; font-size: 14px; font-weight: 800; align-self: flex-start; font-family: 'Source Sans 3', sans-serif; }
+    .auth-note, .setup-box { background: var(--bg); border: 1px solid var(--border); border-radius: 12px; padding: 14px; color: var(--muted); font-size: 13px; line-height: 1.7; }
+    .setup-box { display: flex; flex-direction: column; gap: 6px; }
+    .setup-box code { color: var(--accent); font-family: 'IBM Plex Mono', monospace; font-size: 12px; }
 
-    /* MAIN LAYOUT */
-    .main-layout { display: flex; min-height: 100vh; background: var(--bg); }
-
-    /* Sidebar */
-    .sidebar { width: 260px; min-height: 100vh; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; padding: 22px 0; position: sticky; top: 0; height: 100vh; }
+    /* Layout */
+    .main-layout { display: flex; min-height: 100vh; }
+    .sidebar { width: 250px; min-height: 100vh; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; padding: 22px 0; position: sticky; top: 0; height: 100vh; }
     .sidebar-logo { display: flex; align-items: center; gap: 12px; padding: 0 20px 24px; border-bottom: 1px solid var(--border); margin-bottom: 16px; }
-    .sidebar-brand { font-size: 18px; font-weight: 800; color: var(--text); letter-spacing: -0.01em; }
+    .sidebar-brand { font-size: 17px; font-weight: 800; color: var(--text); }
     .sidebar-sub { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
     .sidebar-nav { flex: 1; padding: 0 12px; display: flex; flex-direction: column; gap: 4px; }
-    .nav-item { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border-radius: 8px; border: none; background: transparent; color: var(--muted); font-family: 'Source Sans 3', sans-serif; font-size: 16px; font-weight: 700; cursor: pointer; text-align: left; transition: all .2s; }
+    .nav-item { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border-radius: 8px; border: none; background: transparent; color: var(--muted); font-family: 'Source Sans 3', sans-serif; font-size: 15px; font-weight: 700; cursor: pointer; text-align: left; transition: all .2s; }
     .nav-item:hover { background: #eef3f8; color: var(--text); }
     .nav-item.active { background: #e8f0f8; color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
     .nav-icon { font-size: 15px; width: 20px; text-align: center; }
@@ -2728,270 +1653,200 @@ function CSS() {
     .user-role { font-size: 11px; color: var(--muted); text-transform: uppercase; }
     .logout-btn { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 18px; padding: 4px; }
 
-    /* Content */
-    .content-area { flex: 1; width: min(100%, 1400px); max-width: 1400px; margin: 0 auto; padding: 38px 42px 56px; overflow-y: auto; }
-    .page-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 24px; margin-bottom: 28px; }
-    .page-title { font-size: 34px; font-weight: 800; color: var(--text); letter-spacing: -0.03em; line-height: 1.1; }
-    .page-sub { font-size: 16px; color: var(--muted); margin-top: 6px; }
-    .header-badge { padding: 6px 16px; background: rgba(239,68,68,.15); color: var(--red); border-radius: 20px; font-size: 12px; font-weight: 700; border: 1px solid rgba(239,68,68,.3); }
+    .content-area { flex: 1; padding: 36px 40px 56px; overflow-y: auto; max-width: 1300px; }
+    .page-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 28px; }
+    .page-title { font-size: 32px; font-weight: 800; color: var(--text); letter-spacing: -0.03em; }
+    .page-sub { font-size: 15px; color: var(--muted); margin-top: 4px; }
+    .header-badge { padding: 6px 14px; background: rgba(239,68,68,.12); color: var(--red); border-radius: 20px; font-size: 12px; font-weight: 700; border: 1px solid rgba(239,68,68,.25); }
 
-    /* Stats Grid */
-    .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 24px; }
+    /* Stats */
+    .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px,1fr)); gap: 16px; margin-bottom: 24px; }
     .stat-card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; position: relative; overflow: hidden; box-shadow: var(--shadow); }
     .stat-card::before { content: ''; position: absolute; top: 0; left: 0; bottom: 0; width: 4px; }
     .stat-accent::before { background: var(--accent); }
     .stat-blue::before { background: var(--blue); }
-    .stat-purple::before { background: var(--accent2); }
+    .stat-purple::before { background: #7c3aed; }
     .stat-red::before { background: var(--red); }
     .stat-green::before { background: var(--green); }
     .stat-yellow::before { background: var(--yellow); }
-    .stat-label { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); font-weight: 800; margin-bottom: 8px; }
-    .stat-value { font-size: 32px; font-weight: 800; color: var(--text); letter-spacing: -0.03em; }
-    .stat-icon { font-size: 22px; margin-bottom: 8px; }
+    .stat-label { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); font-weight: 800; margin-bottom: 6px; }
+    .stat-value { font-size: 30px; font-weight: 800; color: var(--text); }
+    .stat-icon { font-size: 20px; margin-bottom: 6px; }
 
-    /* Cards */
     .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 24px; margin-bottom: 20px; box-shadow: var(--shadow); }
-    .card-title { font-size: 16px; font-weight: 800; text-transform: uppercase; letter-spacing: .08em; color: var(--accent); margin-bottom: 20px; }
-    .two-col { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; margin-bottom: 20px; }
-
-    /* Score bars */
-    .score-bars { display: flex; flex-direction: column; gap: 16px; }
-    .score-bar-row { display: flex; flex-direction: column; gap: 6px; }
-    .score-bar-label { display: flex; justify-content: space-between; font-size: 15px; color: var(--text); font-weight: 700; }
-    .score-bar-track { height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; }
-    .score-bar-fill { height: 100%; background: var(--accent); border-radius: 4px; transition: width .8s ease; }
-
-    /* Answers */
-    .answers-list { display: flex; flex-direction: column; gap: 16px; }
-    .answer-item { background: var(--subtle); border: 1px solid var(--border); border-radius: 10px; padding: 18px; }
-    .answer-label { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--accent); font-weight: 800; margin-bottom: 10px; }
-    .answer-text { font-size: 15px; color: var(--text); line-height: 1.7; font-family: 'IBM Plex Mono', monospace; white-space: pre-wrap; }
-
-    /* Empty state */
+    .card-title { font-size: 14px; font-weight: 800; text-transform: uppercase; letter-spacing: .08em; color: var(--accent); margin-bottom: 18px; }
+    .two-col { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; margin-bottom: 20px; }
+    .muted { color: var(--muted); font-size: 14px; }
+    .empty-chart { color: var(--muted); font-size: 14px; text-align: center; padding: 40px; }
     .empty-state { text-align: center; padding: 80px 40px; }
     .empty-icon { font-size: 56px; margin-bottom: 16px; }
     .empty-state h3 { font-size: 20px; font-weight: 800; margin-bottom: 8px; }
     .empty-state p { color: var(--muted); font-size: 14px; margin-bottom: 24px; max-width: 400px; margin-left: auto; margin-right: auto; line-height: 1.7; }
 
-    /* Assessment */
-    .section-nav { display: flex; gap: 10px; margin-bottom: 24px; flex-wrap: wrap; }
-    .section-pill { padding: 10px 16px; border-radius: 999px; border: 1px solid var(--border-strong); background: #fff; color: var(--muted); font-family: 'Source Sans 3', sans-serif; font-size: 15px; font-weight: 800; cursor: pointer; display: flex; align-items: center; gap: 8px; transition: all .2s; }
-    .section-pill:hover { border-color: var(--accent); color: var(--accent); }
-    .section-pill.active { background: var(--accent); border-color: var(--accent); color: #fff; }
-    .section-pill.done { border-color: #b7d5c7; color: var(--green); background: #edf7f2; }
+    /* ── File Upload ── */
+    .drop-zone { border: 2px dashed var(--border-strong); border-radius: 12px; padding: 32px; text-align: center; cursor: pointer; transition: all .2s; background: var(--subtle); user-select: none; }
+    .drop-zone:hover, .drop-zone.dragging { border-color: var(--accent); background: #eef3f8; }
+    .drop-zone.disabled { opacity: .5; cursor: not-allowed; pointer-events: none; }
+    .drop-icon { font-size: 32px; margin-bottom: 8px; }
+    .drop-label { font-size: 16px; font-weight: 700; color: var(--text); margin-bottom: 4px; }
+    .drop-hint { font-size: 13px; color: var(--muted); }
+    .file-list { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+    .file-item { display: flex; align-items: center; gap: 12px; background: var(--subtle); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+    .file-item.file-done { border-color: rgba(31,122,77,0.3); background: rgba(236,253,245,0.7); }
+    .file-item.file-error { border-color: rgba(180,35,24,0.3); background: rgba(255,241,240,0.7); }
+    .file-icon { font-size: 22px; flex-shrink: 0; }
+    .file-info { flex: 1; min-width: 0; }
+    .file-name { font-size: 14px; font-weight: 700; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .file-meta { font-size: 12px; color: var(--muted); margin-top: 2px; font-family: 'IBM Plex Mono', monospace; }
+    .file-err-label { color: var(--red); }
+    .file-ok-label { color: var(--green); }
+    .file-progress-track { height: 4px; background: var(--border); border-radius: 2px; margin-top: 6px; overflow: hidden; }
+    .file-progress-bar { height: 100%; background: var(--accent); border-radius: 2px; transition: width .3s; }
+    .file-remove { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 16px; padding: 4px; flex-shrink: 0; }
+    .file-view-btn { background: var(--accent); color: #fff; border: none; border-radius: 6px; padding: 5px 12px; font-size: 12px; font-weight: 700; cursor: pointer; text-decoration: none; font-family: 'Source Sans 3', sans-serif; white-space: nowrap; }
+    .file-type-chip { background: var(--subtle); border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; font-size: 12px; color: var(--muted); font-weight: 600; }
+    .upload-section { background: var(--subtle); border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-bottom: 16px; }
+    .upload-section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+    .upload-section-title { font-size: 15px; font-weight: 800; color: var(--text); }
+    .upload-section-hint { font-size: 12px; color: var(--muted); font-family: 'IBM Plex Mono', monospace; }
+    .upload-tips { font-size: 13px; color: var(--muted); line-height: 1.6; max-width: 400px; }
 
-    .assessment-card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 34px; margin-bottom: 20px; box-shadow: var(--shadow); }
-    .section-header { margin-bottom: 28px; max-width: 980px; }
-    .section-title { font-size: 26px; font-weight: 800; color: var(--text); display: flex; align-items: center; gap: 12px; margin-bottom: 12px; letter-spacing: -0.02em; }
-    .pts-badge { background: #eef3f8; color: var(--accent); padding: 4px 11px; border-radius: 999px; font-size: 13px; font-weight: 800; border: 1px solid var(--border); }
-    .section-desc { font-size: 18px; color: var(--text); line-height: 1.65; }
+    /* Tasks */
+    .tasks-layout { display: grid; grid-template-columns: 380px 1fr; gap: 20px; align-items: start; }
+    .task-list { display: flex; flex-direction: column; gap: 10px; }
+    .task-card { width: 100%; text-align: left; background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 16px; cursor: pointer; transition: .15s; box-shadow: 0 6px 18px rgba(20,32,51,0.06); }
+    .task-card:hover { border-color: rgba(23,59,99,0.4); transform: translateY(-1px); }
+    .task-card.active { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(23,59,99,0.12); }
+    .task-card-top { display: flex; align-items: start; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+    .task-title { font-weight: 900; font-size: 15px; color: var(--text); line-height: 1.2; }
+    .task-desc { font-size: 13px; color: var(--muted); line-height: 1.5; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
+    .task-meta { margin-top: 8px; font-size: 11px; color: var(--muted); font-family: 'IBM Plex Mono', monospace; }
+    .task-status { font-size: 11px; font-weight: 900; border-radius: 999px; padding: 5px 10px; border: 1px solid; white-space: nowrap; }
+    .task-status.open { background: #ecfdf5; border-color: rgba(34,197,94,0.25); color: #166534; }
+    .task-status.submitted { background: #eff6ff; border-color: rgba(37,99,235,0.22); color: #1d4ed8; }
+    .task-status.expired { background: #fff7ed; border-color: rgba(251,146,60,0.3); color: #9a3412; }
+    .task-detail { display: flex; flex-direction: column; gap: 16px; }
+    .task-detail-head { display: flex; align-items: start; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+    .task-detail-title { font-size: 18px; font-weight: 900; margin: 0; }
+    .task-detail-sub { color: var(--muted); font-size: 12px; font-family: 'IBM Plex Mono', monospace; margin-top: 4px; }
+    .task-full-desc { color: var(--text); line-height: 1.7; font-size: 15px; white-space: pre-wrap; }
+    .task-actions { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-top: 16px; flex-wrap: wrap; }
+    .task-answer { min-height: 180px; }
+    .task-create-grid { display: grid; grid-template-columns: 1fr 320px; gap: 16px; align-items: start; }
+    .task-admin-table { display: flex; flex-direction: column; gap: 8px; }
+    .task-admin-head { display: grid; grid-template-columns: 1.7fr 1fr 0.7fr 0.5fr 0.7fr; gap: 12px; padding: 10px 12px; border-bottom: 1px solid var(--border); color: var(--muted); font-weight: 800; font-size: 12px; }
+    .task-admin-row { display: grid; grid-template-columns: 1.7fr 1fr 0.7fr 0.5fr 0.7fr; gap: 12px; padding: 12px; border: 1px solid var(--border); border-radius: 12px; background: rgba(255,255,255,0.8); align-items: center; transition: border-color .15s; }
+    .task-admin-row:hover { border-color: var(--accent); }
+    .task-admin-title { font-weight: 800; font-size: 14px; }
+    .task-status-pill { font-size: 11px; font-weight: 800; padding: 5px 10px; border-radius: 999px; border: 1px solid; width: fit-content; }
+    .task-status-pill.active { background: #eff6ff; border-color: rgba(37,99,235,0.2); color: #1d4ed8; }
+    .task-status-pill.expired { background: #fff7ed; border-color: rgba(251,146,60,0.25); color: #9a3412; }
+    .task-status-pill.inactive { background: #f1f5f9; border-color: rgba(148,163,184,0.4); color: #475569; }
 
-    .sample-output { background: #f8fafc; border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin-bottom: 20px; font-family: 'IBM Plex Mono', monospace; font-size: 15px; color: var(--text); line-height: 1.7; border-left: 4px solid var(--accent); }
-    .sample-output.weak { border-left-color: var(--red); }
+    /* Leaderboard */
+    .task-leaderboard { display: flex; flex-direction: column; gap: 6px; }
+    .task-lb-head { display: grid; grid-template-columns: 70px 1.6fr 150px 110px; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--border); color: var(--muted); font-size: 12px; font-weight: 800; }
+    .task-lb-row { display: grid; grid-template-columns: 70px 1.6fr 150px 110px; gap: 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: rgba(255,255,255,0.8); transition: .15s; }
+    .task-lb-row:hover { border-color: var(--accent); }
+    .task-lb-row.top-ten { border-color: rgba(34,197,94,0.25); background: rgba(236,253,245,0.8); }
+    .task-lb-row.me { box-shadow: 0 0 0 2px rgba(23,59,99,0.15); }
+    .task-lb-rank { font-family: 'IBM Plex Mono', monospace; font-weight: 900; }
+    .task-lb-name { font-weight: 800; }
+    .task-lb-score { text-align: right; font-family: 'IBM Plex Mono', monospace; font-weight: 900; }
 
-    .char-indicator { height: 3px; background: var(--border); border-radius: 2px; margin-top: 8px; overflow: hidden; }
-    .char-bar { height: 100%; border-radius: 2px; transition: width .3s; }
-    .char-count { font-size: 13px; color: var(--muted); margin-top: 6px; font-family: 'IBM Plex Mono', monospace; }
+    /* Candidate list */
+    .candidate-list { display: flex; flex-direction: column; gap: 8px; }
+    .candidate-row { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px 18px; display: flex; align-items: center; gap: 14px; cursor: pointer; transition: .15s; box-shadow: 0 4px 12px rgba(20,32,51,0.05); }
+    .candidate-row:hover { border-color: var(--accent); transform: translateY(-1px); }
+    .rank-num { width: 28px; font-size: 13px; font-weight: 800; color: var(--muted); font-family: 'IBM Plex Mono', monospace; }
+    .candidate-info { flex: 1; min-width: 0; }
+    .candidate-name { font-size: 15px; font-weight: 800; color: var(--text); }
+    .candidate-meta { font-size: 12px; color: var(--muted); margin-top: 2px; }
+    .total-score { font-size: 20px; font-weight: 800; color: var(--text); min-width: 52px; text-align: right; }
+    .total-score span { font-size: 12px; color: var(--muted); }
 
-    .assessment-nav { display: flex; align-items: center; justify-content: space-between; }
-    .progress-dots { display: flex; gap: 8px; }
-    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border); transition: all .2s; }
-    .dot.active { background: var(--accent); transform: scale(1.3); }
-    .dot.done { background: var(--green); }
+    /* Skill badges */
+    .skill-badge { padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 800; border: 1px solid; white-space: nowrap; }
+    .skill-beginner { background: rgba(180,35,24,.1); color: var(--red); border-color: rgba(180,35,24,.25); }
+    .skill-intermediate { background: rgba(161,92,7,.1); color: var(--yellow); border-color: rgba(161,92,7,.25); }
+    .skill-advanced { background: rgba(31,122,77,.1); color: var(--green); border-color: rgba(31,122,77,.25); }
+    .skill-pending { background: rgba(102,117,138,.1); color: var(--muted); border-color: rgba(102,117,138,.25); }
 
-    .assessment-controls { display: flex; gap: 12px; align-items: center; }
-    .timer { font-family: 'IBM Plex Mono', monospace; font-size: 18px; font-weight: 700; color: var(--text); background: var(--card); border: 1px solid var(--border); padding: 8px 16px; border-radius: 10px; }
-    .timer.timer-urgent { color: var(--red); border-color: var(--red); animation: pulse 1s infinite; }
-    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .6; } }
+    /* Pending/chips */
+    .pending-chip { background: rgba(161,92,7,.12); color: var(--yellow); border: 1px solid rgba(161,92,7,.25); border-radius: 20px; padding: 4px 10px; font-size: 12px; font-weight: 800; white-space: nowrap; }
+    .score-chips-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding-bottom: 14px; border-bottom: 1px solid var(--border); }
+    .score-chips-row span { font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--muted); }
+    .total-chip { background: #eef3f8; color: var(--accent); border: 1px solid var(--border); padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 800; }
+    .flag-alert { background: rgba(245,158,11,.1); border: 1px solid rgba(245,158,11,.3); border-radius: 10px; padding: 10px 14px; font-size: 13px; color: var(--yellow); }
 
-    /* Flag alert */
-    .flag-alert { background: rgba(245,158,11,.1); border: 1px solid rgba(245,158,11,.3); border-radius: 10px; padding: 10px 14px; font-size: 12px; color: var(--yellow); margin-top: 12px; }
-    .benchmark-note { color: var(--muted); font-size: 12px; text-align: center; line-height: 1.6; margin-top: 8px; }
-    .benchmark-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
-    .benchmark-grid div { background: var(--subtle); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
-    .benchmark-grid span { display: block; color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: .08em; margin-bottom: 6px; font-weight: 800; }
-    .benchmark-grid strong { color: var(--text); font-size: 24px; font-family: 'IBM Plex Mono', monospace; }
+    /* Pending list */
+    .pending-list { display: flex; flex-direction: column; gap: 8px; }
+    .pending-row { display: flex; align-items: center; gap: 12px; background: var(--subtle); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; cursor: pointer; transition: .15s; }
+    .pending-row:hover { border-color: var(--accent); }
+    .pending-info { flex: 1; }
+    .pending-name { font-size: 14px; font-weight: 800; color: var(--text); }
+    .pending-task { font-size: 12px; color: var(--muted); margin-top: 2px; }
+
+    /* Answers */
+    .answers-list { display: flex; flex-direction: column; gap: 12px; }
+    .answer-item { background: var(--subtle); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+    .answer-label { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--accent); font-weight: 800; margin-bottom: 8px; }
+    .answer-text { font-size: 14px; color: var(--text); line-height: 1.7; font-family: 'IBM Plex Mono', monospace; white-space: pre-wrap; }
+
+    /* Feedback */
     .feedback-list { display: flex; flex-direction: column; gap: 8px; }
-    .feedback-item { background: var(--subtle); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; color: var(--text); font-size: 15px; line-height: 1.6; }
-    .eval-source { margin-top: 12px; color: var(--muted); font-size: 12px; font-family: 'IBM Plex Mono', monospace; text-transform: uppercase; }
-    .signal-list { display: flex; flex-wrap: wrap; gap: 8px; }
-    .signal-list span { background: #fff7ed; border: 1px solid #fed7aa; color: var(--yellow); border-radius: 8px; padding: 6px 8px; font-size: 12px; font-family: 'IBM Plex Mono', monospace; }
+    .feedback-item { background: var(--subtle); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; color: var(--text); font-size: 14px; line-height: 1.6; }
 
-    /* Ring */
-    .ring-wrap { display: flex; justify-content: center; }
-    .ring-svg { width: 140px; height: 140px; }
-
-    /* Percentile */
+    /* Pie chart */
     .pie-chart-wrap { display: flex; align-items: center; gap: 24px; }
-    .pie-svg { width: 160px; height: 160px; flex-shrink: 0; }
-    .pie-legend { display: flex; flex-direction: column; gap: 12px; }
+    .pie-svg { width: 150px; height: 150px; flex-shrink: 0; }
+    .pie-legend { display: flex; flex-direction: column; gap: 10px; }
     .legend-item { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--text); font-weight: 600; }
     .legend-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
     .legend-val { margin-left: auto; background: var(--subtle); padding: 2px 8px; border-radius: 6px; font-size: 12px; }
 
-    /* Bar Chart */
-    .bar-chart { display: flex; align-items: flex-end; gap: 12px; height: 160px; }
-    .bar-item { flex: 1; display: flex; flex-direction: column; align-items: center; height: 100%; }
-    .bar-wrap { flex: 1; display: flex; align-items: flex-end; width: 100%; justify-content: center; }
-    .bar-fill { width: 100%; max-width: 40px; background: var(--accent); border-radius: 6px 6px 0 0; display: flex; align-items: flex-start; justify-content: center; padding-top: 6px; transition: height .6s ease; min-height: 4px; }
-    .bar-val { font-size: 11px; font-weight: 700; color: #fff; }
-    .bar-label { font-size: 11px; color: var(--muted); margin-top: 6px; font-weight: 600; }
-
-    /* Histogram */
-    .histogram { display: flex; gap: 8px; height: 120px; align-items: flex-end; }
-    .hist-col { flex: 1; display: flex; flex-direction: column; align-items: center; height: 100%; }
-    .hist-bar-wrap { flex: 1; display: flex; align-items: flex-end; width: 100%; }
-    .hist-bar { width: 100%; background: var(--blue); border-radius: 4px 4px 0 0; display: flex; align-items: flex-start; justify-content: center; padding-top: 4px; min-height: 4px; transition: height .6s; }
-    .hist-val { font-size: 10px; color: #fff; font-weight: 700; }
-    .hist-label { font-size: 11px; color: var(--muted); margin-top: 4px; font-family: 'IBM Plex Mono', monospace; }
-    .empty-chart { color: var(--muted); font-size: 13px; text-align: center; padding: 40px; }
-
-    /* Daily Tasks */
-    .daily-tasks-page .page-title { font-size: 34px; letter-spacing: -0.03em; }
-    .daily-tasks-page .page-sub { font-size: 15px; max-width: 720px; }
-    .tasks-layout { display: grid; grid-template-columns: 420px 1fr; gap: 22px; align-items: start; }
-    .task-list { display: flex; flex-direction: column; gap: 12px; }
-    .task-card { width: 100%; text-align: left; background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 16px; cursor: pointer; transition: 0.15s; box-shadow: 0 10px 24px rgba(20, 32, 51, 0.06); }
-    .task-card:hover { transform: translateY(-1px); border-color: rgba(35, 88, 187, 0.35); }
-    .task-card.active { border-color: rgba(35, 88, 187, 0.55); box-shadow: 0 12px 30px rgba(16, 24, 40, 0.08); }
-    .task-card-top { display: flex; align-items: start; justify-content: space-between; gap: 10px; }
-    .task-title { font-weight: 900; font-size: 16px; color: var(--text); line-height: 1.2; letter-spacing: -0.01em; }
-    .task-desc { margin-top: 10px; font-size: 13px; color: var(--muted); line-height: 1.55; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
-    .task-meta { margin-top: 10px; font-size: 11px; color: var(--muted); font-family: 'IBM Plex Mono', monospace; }
-    .task-status { font-size: 11px; font-weight: 900; border-radius: 999px; padding: 6px 10px; border: 1px solid var(--border); }
-    .task-status.open { background: #ecfdf5; border-color: rgba(34, 197, 94, 0.28); color: #166534; }
-    .task-status.submitted { background: #eff6ff; border-color: rgba(37, 99, 235, 0.25); color: #1d4ed8; }
-    .task-status.expired { background: #fff7ed; border-color: rgba(251, 146, 60, 0.35); color: #9a3412; }
-    .task-detail { display: flex; flex-direction: column; gap: 16px; }
-    .task-detail .card { border-radius: 16px; padding: 26px 28px; }
-    .task-detail-head { display: flex; align-items: start; justify-content: space-between; gap: 14px; margin-bottom: 12px; }
-    .task-detail-title { font-size: 18px; font-weight: 900; letter-spacing: -0.01em; margin: 0; }
-    .task-detail-sub { color: var(--muted); font-size: 12px; font-family: 'IBM Plex Mono', monospace; margin-top: 6px; }
-    .task-full-desc { color: var(--text); line-height: 1.7; font-size: 14px; white-space: pre-wrap; }
-    .task-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; }
-
-    .task-answer { min-height: 360px; font-size: 16px; padding: 18px; width: 100%; }
-    .task-answer:disabled { background: #f8fafc; }
-
-    .task-leaderboard { display: flex; flex-direction: column; gap: 6px; }
-    .task-lb-head { display: grid; grid-template-columns: 70px 1.6fr 150px 110px; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--border); color: var(--muted); font-size: 12px; font-weight: 900; }
-    .task-lb-row { display: grid; grid-template-columns: 70px 1.6fr 150px 110px; gap: 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 12px; background: rgba(255,255,255,0.7); }
-    .task-lb-row:hover { border-color: rgba(35, 88, 187, 0.28); }
-    .task-lb-row.top-ten { border-color: rgba(34, 197, 94, 0.25); background: rgba(236, 253, 245, 0.8); }
-    .task-lb-row.me { box-shadow: 0 0 0 2px rgba(35, 88, 187, 0.18); }
-    .task-lb-rank { font-family: 'IBM Plex Mono', monospace; font-weight: 900; }
-    .task-lb-name { font-weight: 900; }
-    .task-lb-score { text-align: right; font-family: 'IBM Plex Mono', monospace; font-weight: 900; }
-
-    .task-admin-table { display: flex; flex-direction: column; gap: 10px; }
-    .task-admin-head { display: grid; grid-template-columns: 1.7fr 1fr 0.7fr 0.5fr 0.6fr; gap: 12px; padding: 10px 12px; border-bottom: 1px solid var(--border); color: var(--muted); font-weight: 900; font-size: 12px; }
-    .task-admin-row { display: grid; grid-template-columns: 1.7fr 1fr 0.7fr 0.5fr 0.6fr; gap: 12px; padding: 12px; border: 1px solid var(--border); border-radius: 14px; background: rgba(255,255,255,0.75); align-items: center; }
-    .task-admin-title { font-weight: 900; }
-    .task-status-pill { font-size: 11px; font-weight: 900; padding: 6px 10px; border-radius: 999px; border: 1px solid var(--border); width: fit-content; }
-    .task-status-pill.active { background: #eff6ff; border-color: rgba(37, 99, 235, 0.22); color: #1d4ed8; }
-    .task-status-pill.expired { background: #fff7ed; border-color: rgba(251, 146, 60, 0.28); color: #9a3412; }
-    .task-status-pill.inactive { background: #f1f5f9; border-color: rgba(148, 163, 184, 0.45); color: #475569; }
-
-    .task-create-grid { display: grid; grid-template-columns: 1fr 360px; gap: 16px; align-items: start; }
-    .datetime-input { appearance: none; -webkit-appearance: none; padding-right: 42px; background-image: linear-gradient(transparent, transparent), url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20' viewBox='0 0 24 24' fill='none' stroke='%2366758a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3' y='4' width='18' height='18' rx='2' ry='2'/%3E%3Cline x1='16' y1='2' x2='16' y2='6'/%3E%3Cline x1='8' y1='2' x2='8' y2='6'/%3E%3Cline x1='3' y1='10' x2='21' y2='10'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 12px center; background-size: 18px; }
-    .datetime-input::-webkit-calendar-picker-indicator { opacity: 0; display: block; width: 36px; height: 36px; cursor: pointer; }
-
-    @media (max-width: 1100px) {
-      .tasks-layout { grid-template-columns: 1fr; }
-      .task-create-grid { grid-template-columns: 1fr; }
-      .task-lb-head, .task-lb-row { grid-template-columns: 70px 1.6fr 120px 90px; }
-      .task-admin-head, .task-admin-row { grid-template-columns: 1.4fr 1fr 0.7fr 0.5fr 0.7fr; }
-    }
-
-    /* Admin */
-    .filter-bar { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
-    .filter-select { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 9px 12px; color: var(--text); font-family: 'Source Sans 3', sans-serif; font-size: 15px; font-weight: 700; cursor: pointer; outline: none; }
-    .insight-grid { display: grid; grid-template-columns: 1fr 1.4fr 1fr; gap: 14px; }
-    .insight-panel { background: var(--subtle); border: 1px solid var(--border); border-radius: 12px; padding: 16px; min-height: 128px; }
-    .insight-kicker { color: var(--accent); font-size: 12px; font-weight: 800; text-transform: uppercase; letter-spacing: .08em; margin-bottom: 10px; }
-    .insight-value { color: var(--text); font-size: 32px; font-weight: 800; font-family: 'IBM Plex Mono', monospace; margin-bottom: 8px; }
-    .insight-body { color: var(--muted); font-size: 14px; line-height: 1.6; }
-    .mistake-list { display: flex; flex-wrap: wrap; gap: 8px; }
-    .mistake-list span { background: rgba(239,68,68,.1); color: var(--red); border: 1px solid rgba(239,68,68,.25); border-radius: 999px; padding: 6px 10px; font-size: 11px; font-weight: 700; }
-
-    .candidate-list { display: flex; flex-direction: column; gap: 8px; }
-    .candidate-row { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px 20px; display: flex; align-items: center; gap: 16px; cursor: pointer; transition: border-color .2s, transform .15s; box-shadow: 0 4px 18px rgba(20, 32, 51, 0.05); }
-    .candidate-row:hover { border-color: var(--accent); transform: translateY(-1px); }
-    .rank-num { width: 28px; font-size: 13px; font-weight: 800; color: var(--muted); font-family: 'IBM Plex Mono', monospace; }
-    .candidate-info { flex: 1; min-width: 0; }
-    .candidate-name { font-size: 16px; font-weight: 800; color: var(--text); }
-    .candidate-meta { font-size: 13px; color: var(--muted); margin-top: 2px; }
-    .candidate-scores { display: flex; gap: 6px; }
-    .score-chip { background: var(--subtle); border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; font-size: 12px; font-weight: 700; font-family: 'IBM Plex Mono', monospace; color: var(--text); }
-    .total-score { font-size: 20px; font-weight: 800; color: var(--text); min-width: 52px; text-align: right; }
-    .total-score span { font-size: 12px; color: var(--muted); }
-    .flag-chip { background: rgba(245,158,11,.15); color: var(--yellow); border: 1px solid rgba(245,158,11,.3); border-radius: 6px; padding: 3px 8px; font-size: 11px; font-weight: 700; white-space: nowrap; }
-
-    /* Skill Badges */
-    .skill-badge { padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 800; border: 1px solid; }
-    .skill-beginner { background: rgba(239,68,68,.1); color: var(--red); border-color: rgba(239,68,68,.3); }
-    .skill-intermediate { background: rgba(245,158,11,.1); color: var(--yellow); border-color: rgba(245,158,11,.3); }
-    .skill-advanced { background: rgba(34,197,94,.1); color: var(--green); border-color: rgba(34,197,94,.3); }
-
-    /* Leaderboard */
-    .leaderboard { display: flex; flex-direction: column; gap: 10px; }
-    .leaderboard-row { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 18px 24px; display: flex; align-items: center; gap: 16px; transition: transform .15s; }
-    .leaderboard-row:hover { transform: translateX(4px); }
-    .leaderboard-row.rank-1 { border-color: #f59e0b; background: rgba(245,158,11,.05); }
-    .leaderboard-row.rank-2 { border-color: #9ca3af; background: rgba(156,163,175,.05); }
-    .leaderboard-row.rank-3 { border-color: #b45309; background: rgba(180,83,9,.05); }
-    .lb-rank { font-size: 24px; width: 36px; text-align: center; }
-    .lb-avatar { width: 40px; height: 40px; border-radius: 50%; background: var(--accent); display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 16px; color: #fff; flex-shrink: 0; }
-    .lb-info { flex: 1; }
-    .lb-name { font-size: 16px; font-weight: 800; color: var(--text); }
-    .lb-meta { font-size: 13px; color: var(--muted); margin-top: 2px; }
-    .lb-score { display: flex; align-items: center; gap: 12px; min-width: 160px; }
-    .lb-score-bar { height: 6px; background: var(--accent); border-radius: 3px; }
-    .lb-score span { font-size: 16px; font-weight: 800; color: var(--text); font-family: 'IBM Plex Mono', monospace; white-space: nowrap; }
-
-    /* Modal */
-    .modal-overlay { position: fixed; inset: 0; background: rgba(20,32,51,.48); z-index: 999; display: flex; align-items: center; justify-content: center; padding: 24px; }
-    .modal { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; width: 520px; max-height: 90vh; display: flex; flex-direction: column; overflow: hidden; }
-    .modal.modal-wide { width: 720px; }
-    .modal-header { padding: 24px 24px 0; display: flex; justify-content: space-between; align-items: flex-start; border-bottom: 1px solid var(--border); padding-bottom: 16px; }
-    .modal-header h3 { font-size: 22px; font-weight: 800; color: var(--text); }
-    .modal-sub { font-size: 14px; color: var(--muted); margin-top: 3px; }
-    .modal-body { padding: 24px; overflow-y: auto; display: flex; flex-direction: column; gap: 16px; flex: 1; }
+    /* Modals */
+    .modal-overlay { position: fixed; inset: 0; background: rgba(20,32,51,.5); z-index: 999; display: flex; align-items: center; justify-content: center; padding: 24px; }
+    .modal { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; width: 520px; max-height: 90vh; display: flex; flex-direction: column; overflow: hidden; box-shadow: 0 24px 60px rgba(0,0,0,0.2); }
+    .modal.modal-wide { width: 740px; }
+    .modal-header { padding: 22px 24px 0; display: flex; justify-content: space-between; align-items: flex-start; border-bottom: 1px solid var(--border); padding-bottom: 16px; }
+    .modal-header h3 { font-size: 20px; font-weight: 800; color: var(--text); }
+    .modal-sub { font-size: 13px; color: var(--muted); margin-top: 3px; }
+    .modal-body { padding: 22px 24px; overflow-y: auto; display: flex; flex-direction: column; gap: 16px; flex: 1; }
     .modal-body.scrollable { overflow-y: auto; max-height: calc(90vh - 130px); }
-    .modal-footer { padding: 16px 24px; border-top: 1px solid var(--border); display: flex; gap: 10px; justify-content: flex-end; }
+    .modal-footer { padding: 14px 24px; border-top: 1px solid var(--border); display: flex; gap: 10px; justify-content: flex-end; }
     .close-btn { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 20px; line-height: 1; padding: 4px; }
 
-    .score-input-row { display: flex; flex-direction: column; gap: 8px; }
-    .score-input-row label { font-size: 13px; font-weight: 800; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); display: flex; align-items: center; gap: 8px; }
-    .max-hint { color: var(--border); font-size: 11px; }
+    /* Scoring */
+    .score-input-row { display: flex; flex-direction: column; gap: 6px; }
+    .score-input-row label { font-size: 13px; font-weight: 800; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+    .score-hint { font-size: 12px; color: var(--muted); margin-top: -2px; }
+    .max-hint { color: var(--border-strong); font-size: 11px; font-weight: 400; }
     .score-input-wrap { display: flex; align-items: center; gap: 12px; }
-    .score-range { flex: 1; accent-color: var(--accent); cursor: pointer; height: 4px; }
-    .score-num { width: 60px; background: var(--subtle); border: 1px solid var(--border); border-radius: 8px; padding: 8px; color: var(--text); font-family: 'IBM Plex Mono', monospace; font-size: 16px; font-weight: 700; text-align: center; outline: none; }
-    .total-preview { background: var(--subtle); border-radius: 10px; padding: 16px; display: flex; align-items: center; gap: 12px; margin-top: 8px; }
+    .score-range { flex: 1; accent-color: var(--accent); cursor: pointer; }
+    .score-num { width: 58px; background: var(--subtle); border: 1px solid var(--border); border-radius: 8px; padding: 8px; color: var(--text); font-family: 'IBM Plex Mono', monospace; font-size: 16px; font-weight: 700; text-align: center; outline: none; }
+    .total-preview { background: var(--subtle); border-radius: 10px; padding: 14px 16px; display: flex; align-items: center; gap: 12px; }
     .total-preview span:first-child { flex: 1; font-size: 14px; font-weight: 700; color: var(--muted); }
     .total-num { font-size: 24px; font-weight: 800; color: var(--text); font-family: 'IBM Plex Mono', monospace; }
-    .total-chip { background: #eef3f8; color: var(--accent); border: 1px solid var(--border); padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 800; }
-    .score-chips-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
-    .score-chips-row span { font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--muted); }
+
+    /* Filter */
+    .filter-bar { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
+    .filter-select { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 9px 12px; color: var(--text); font-family: 'Source Sans 3', sans-serif; font-size: 15px; font-weight: 700; cursor: pointer; outline: none; }
 
     /* Responsive */
-    @media (max-width: 900px) {
+    @media (max-width: 960px) {
+      .tasks-layout { grid-template-columns: 1fr; }
+      .task-create-grid { grid-template-columns: 1fr; }
+      .two-col { grid-template-columns: 1fr; }
+      .content-area { padding: 20px; }
+      .sidebar { width: 56px; }
+      .sidebar-logo div, .sidebar-brand, .sidebar-sub, .user-name, .user-role { display: none; }
+      .nav-item { justify-content: center; font-size: 0; padding: 12px; }
+      .nav-icon { font-size: 18px; }
+      .form-row { grid-template-columns: 1fr; }
+      .task-lb-head, .task-lb-row { grid-template-columns: 50px 1fr 100px 80px; }
       .auth-hero { display: none; }
       .auth-card { width: 100%; min-width: unset; }
-      .stats-grid { grid-template-columns: repeat(2, 1fr); }
-      .two-col { grid-template-columns: 1fr; }
-      .content-area { padding: 20px; max-width: 100vw; }
-      .sidebar { width: 60px; padding: 16px 0; }
-      .sidebar-logo, .sidebar-brand, .sidebar-sub, .user-name, .user-role, .sidebar-sub { display: none; }
-      .nav-item { justify-content: center; padding: 12px; font-size: 0; }
-      .nav-icon { font-size: 16px; }
-      .form-row { grid-template-columns: 1fr; }
-      .candidate-scores { display: none; }
-      .insight-grid, .benchmark-grid { grid-template-columns: 1fr; }
-      .section-title { font-size: 23px; align-items: flex-start; flex-direction: column; }
-      .section-desc { font-size: 17px; }
     }
   `;
 }
-
-export default App;

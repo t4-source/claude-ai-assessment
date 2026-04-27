@@ -1,59 +1,129 @@
+// ════════════════════════════════════════════════════════════
+// firestore.rules
+// ════════════════════════════════════════════════════════════
 rules_version = '2';
-
 service cloud.firestore {
   match /databases/{database}/documents {
+
     function signedIn() {
       return request.auth != null;
     }
-
     function isOwner(userId) {
       return signedIn() && request.auth.uid == userId;
     }
-
-    function userProfile() {
-      return get(/databases/$(database)/documents/users/$(request.auth.uid));
-    }
-
     function isAdmin() {
-      return signedIn() && userProfile().data.role == "admin";
+      return signedIn() &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
     }
 
+    // Users
     match /users/{userId} {
       allow create: if isOwner(userId)
         && request.resource.data.role == "candidate"
         && request.resource.data.email == request.auth.token.email;
       allow read: if isOwner(userId) || isAdmin();
-      allow update: if isOwner(userId)
-        && !request.resource.data.diff(resource.data).affectedKeys().hasAny(["role"]);
-      allow update, delete: if isAdmin();
+      allow update: if (isOwner(userId)
+        && !request.resource.data.diff(resource.data).affectedKeys().hasAny(["role"]))
+        || isAdmin();
+      allow delete: if isAdmin();
     }
 
-    match /responses/{responseId} {
-      allow create: if signedIn()
-        && request.resource.data.userId == request.auth.uid;
-      allow read: if signedIn();
-      allow update, delete: if isAdmin();
-    }
-
+    // Tasks (read-only for candidates, full control for admins)
     match /tasks/{taskId} {
-      allow create, update, delete: if isAdmin();
       allow read: if signedIn();
+      allow create, update, delete: if isAdmin();
     }
 
+    // Task submissions
+    // Candidates create via server (Vercel API) — so client-side create is blocked.
+    // If you write submissions directly from the client (no server), change create rule below.
     match /task_submissions/{submissionId} {
-      allow create: if false;
+      // Allow candidates to create their own submission directly from the client
+      allow create: if signedIn()
+        && request.resource.data.userId == request.auth.uid
+        // Prevent score manipulation on create
+        && request.resource.data.totalScore == 0
+        && request.resource.data.evaluationSource == "pending";
       allow read: if isOwner(resource.data.userId) || isAdmin();
       allow update, delete: if isAdmin();
     }
 
+    // Task leaderboards (publicly readable when signed in)
     match /task_leaderboards/{taskId} {
       allow read: if signedIn();
       allow create, update, delete: if isAdmin();
 
       match /entries/{entryId} {
         allow read: if signedIn();
-        allow write: if isAdmin();
+        // Candidates can write their own placeholder entry on submission
+        allow create: if signedIn() && request.auth.uid == entryId
+          && request.resource.data.totalScore == 0;
+        // Only admin can update scores
+        allow update, delete: if isAdmin();
       }
     }
   }
 }
+
+
+// ════════════════════════════════════════════════════════════
+// storage.rules   ← add this in Firebase Console → Storage → Rules
+// ════════════════════════════════════════════════════════════
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // task_submissions/{taskId}/{userId}/{filename}
+    match /task_submissions/{taskId}/{userId}/{filename} {
+
+      // Candidates can upload to their own folder only
+      allow write: if request.auth != null
+        && request.auth.uid == userId
+        // 200 MB max
+        && request.resource.size <= 200 * 1024 * 1024
+        // Allowed MIME types: video, image, PDF, Office documents
+        && (
+          request.resource.contentType.matches('video/.*')   ||
+          request.resource.contentType.matches('image/.*')   ||
+          request.resource.contentType == 'application/pdf'  ||
+          request.resource.contentType == 'application/msword' ||
+          request.resource.contentType.matches('application/vnd\\..*') ||
+          request.resource.contentType.matches('application/.*officedocument.*')
+        );
+
+      // Candidate can read their own files; admin can read all
+      allow read: if request.auth != null && (
+        request.auth.uid == userId ||
+        // Admin check via custom claim (set this up — see note below)
+        request.auth.token.role == "admin"
+      );
+
+      // Candidates cannot delete (admin only)
+      allow delete: if request.auth != null
+        && request.auth.token.role == "admin";
+    }
+  }
+}
+
+
+// ════════════════════════════════════════════════════════════
+// IMPORTANT — Admin Storage read/delete access
+// ════════════════════════════════════════════════════════════
+//
+// The storage rule above checks request.auth.token.role == "admin".
+// Firebase Storage rules CANNOT call Firestore, so you must set a
+// custom claim on admin accounts using Firebase Admin SDK:
+//
+//   // Run once in a server script or Cloud Function:
+//   await admin.auth().setCustomUserClaims(adminUid, { role: "admin" });
+//
+// OR — simpler alternative: make all authenticated users able to read
+// any submission file (replace the read rule with):
+//
+//   allow read: if request.auth != null;
+//
+// This is acceptable because download URLs are unguessable and files
+// are only linked from Firestore docs that candidates cannot read
+// unless they own the submission.
+//
+// ════════════════════════════════════════════════════════════
