@@ -94,14 +94,24 @@ function getIsoDate(value) {
   return "";
 }
 
-function getSkillLevel(totalScore) {
-  if (totalScore < 16) return "Beginner";
-  if (totalScore < 28) return "Intermediate";
+function getSkillLevel(totalScore, maxScore = 40) {
+  const max = Number(maxScore);
+  if (!Number.isFinite(max) || max <= 0) return "Pending";
+  const ratio = Math.max(0, Math.min(1, (Number(totalScore) || 0) / max));
+  if (ratio < 0.4) return "Beginner";
+  if (ratio < 0.7) return "Intermediate";
   return "Advanced";
 }
 
 function clampScore(value, max) {
   return Math.max(0, Math.min(max, Math.round(Number(value) || 0)));
+}
+
+function formatScore(total, max) {
+  const m = Number(max);
+  if (Number.isFinite(m) && m === 0) return "No score";
+  const safe = Number.isFinite(m) && m > 0 ? m : 40;
+  return `${Number(total) || 0}/${safe}`;
 }
 
 // ─── Normalizers ──────────────────────────────────────────────────────────
@@ -120,15 +130,15 @@ function normalizeUser(id, data = {}, authUser = null) {
 }
 
 function normalizeTask(id, data = {}) {
+  const parsedMax = Number(data.maxScore);
+  const maxScore = Number.isFinite(parsedMax) && parsedMax >= 0 ? parsedMax : 40;
   return {
     id,
     title: data.title || "",
     description: data.description || "",
-    createdBy: data.createdBy || "",
-    createdAt: getIsoDate(data.createdAt),
-    deadline: getIsoDate(data.deadline),
-    active: Boolean(data.active),
-    submissionCount: Number(data.submissionCount || 0),
+    deadline: getIsoDate(data.deadline) || "",
+    active: data.active !== false,
+    maxScore,
   };
 }
 
@@ -902,7 +912,7 @@ function DailyTasksPage({ db, currentUser, setView, logout, notify }) {
                             <>
                               <span>Task: {mySubmission.scores.taskScore}/20</span>
                               <span>Eval: {mySubmission.scores.evaluationScore}/10</span>
-                              <span className="total-chip">Total: {mySubmission.totalScore}/40</span>
+                              <span className="total-chip">Total: {formatScore(mySubmission.totalScore, selectedTask.maxScore)}</span>
                               <span className={`skill-badge skill-${mySubmission.skillLevel.toLowerCase()}`}>
                                 {mySubmission.skillLevel}
                               </span>
@@ -1089,15 +1099,17 @@ function TaskLeaderboard({ taskId, currentUser, db }) {
   const topN = ranked.length ? Math.max(1, Math.ceil(ranked.length * 0.1)) : 0;
   const myRank = ranked.findIndex(r => r.userId === currentUser.id) + 1;
 
+  const task = db?.tasks?.find(t => t.id === taskId);
+  const safeMax = Number.isFinite(Number(task?.maxScore)) ? Number(task.maxScore) : 40;
+
   const exportCSV = () => {
     if (!ranked.length) return;
-    const task = db?.tasks?.find(t => t.id === taskId);
     const headers = ["Rank", "Candidate Name", "Skill Level", "Score"];
     const rows = ranked.map((r, i) => [
       `#${i + 1}`,
       `"${r.candidateName.replace(/"/g, '""')}"`,
       r.skillLevel,
-      `${r.totalScore}/40`
+      formatScore(r.totalScore, safeMax),
     ]);
 
     const csvContent = [
@@ -1142,7 +1154,7 @@ function TaskLeaderboard({ taskId, currentUser, db }) {
               <div className="task-lb-rank">{i < 3 ? ["🥇","🥈","🥉"][i] : `#${i+1}`}</div>
               <div className="task-lb-name">{r.candidateName}{r.userId === currentUser.id ? " (You)" : ""}</div>
               <div className={`skill-badge skill-${r.skillLevel.toLowerCase()}`}>{r.skillLevel}</div>
-              <div className="task-lb-score">{r.totalScore}/40</div>
+              <div className="task-lb-score">{formatScore(r.totalScore, safeMax)}</div>
             </div>
           ))}
           {myRank > 0 && <p className="muted" style={{ marginTop: 12 }}>Your rank: #{myRank} of {ranked.length}</p>}
@@ -1155,7 +1167,7 @@ function TaskLeaderboard({ taskId, currentUser, db }) {
 // ─── Admin Dashboard ────────────────────────────────────────────────────────
 function AdminDashboard({ db, currentUser, logout, notify }) {
   const [tab, setTab] = useState("overview");
-  const [taskForm, setTaskForm] = useState({ title: "", description: "", deadline: "" });
+  const [taskForm, setTaskForm] = useState({ title: "", description: "", deadline: "", maxScore: "40" });
   const [scoringModal, setScoringModal] = useState(null);   // task_submission doc
   const [detailModal, setDetailModal] = useState(null);     // task_submission doc
   const [taskViewer, setTaskViewer] = useState(null);       // task doc
@@ -1228,13 +1240,19 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
   };
 
   const saveScores = async (submission, scores, feedback) => {
-    const total = scores.taskScore + scores.evaluationScore;
-    const skillLevel = getSkillLevel(total);
+    const task = db.tasks.find(t => t.id === submission.taskId);
+    const maxScoreRaw = Number(task?.maxScore);
+    const maxScore = Number.isFinite(maxScoreRaw) && maxScoreRaw >= 0 ? maxScoreRaw : 40;
+    const rawTotal = (Number(scores.taskScore) || 0) + (Number(scores.evaluationScore) || 0);
+    const baseMax = 30;
+    const scaled = maxScore === 0 ? 0 : Math.round((rawTotal / baseMax) * maxScore);
+    const total = maxScore === 0 ? 0 : clampScore(scaled, maxScore);
+    const skillLevel = maxScore === 0 ? "No Score" : getSkillLevel(total, maxScore);
     const user = db.users.find(u => u.id === submission.userId);
 
     try {
       await updateDoc(doc(firestore, "task_submissions", submission.id), {
-        scores: { promptScore: 0, ...scores },
+        scores: { promptScore: 0, ...scores, taskScore: Number(scores.taskScore) || 0, evaluationScore: Number(scores.evaluationScore) || 0 },
         totalScore: total,
         skillLevel,
         feedback: feedback ? [feedback] : [],
@@ -1314,7 +1332,7 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
                 { label: "Candidates", value: candidates.length, icon: "👥", color: "blue" },
                 { label: "Total Submissions", value: allSubs.length, icon: "📋", color: "purple" },
                 { label: "Pending Review", value: allSubs.filter(s => s.evaluationSource === "pending").length, icon: "⏳", color: "yellow" },
-                { label: "Avg Score (scored)", value: scoredSubs.length ? avgScore + "/40" : "—", icon: "📊", color: "accent" },
+                { label: "Avg Score (scored)", value: scoredSubs.length ? `${avgScore}` : "—", icon: "📊", color: "accent" },
               ].map(s => (
                 <div key={s.label} className={`stat-card stat-${s.color}`}>
                   <div className="stat-icon">{s.icon}</div>
@@ -1394,7 +1412,11 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
                       ? <span className="pending-chip">⏳ Pending</span>
                       : <div className={`skill-badge skill-${s.skillLevel.toLowerCase()}`}>{s.skillLevel}</div>}
                     <div className="total-score">
-                      {pending ? <span style={{ color: "var(--muted)", fontSize: 14 }}>—</span> : <>{s.totalScore}<span>/40</span></>}
+                      {pending ? (
+                        <span style={{ color: "var(--muted)", fontSize: 14 }}>—</span>
+                      ) : (
+                        <>{formatScore(s.totalScore, task?.maxScore)}</>
+                      )}
                     </div>
                     <button className="btn-score"
                       onClick={e => { e.stopPropagation(); setScoringModal(s); }}>
@@ -1463,23 +1485,39 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
                     <input className="form-input" type="datetime-local" value={taskForm.deadline}
                       onChange={e => setTaskForm(f => ({ ...f, deadline: e.target.value }))} />
                   </div>
+                  <div className="form-group" style={{ marginTop: 12 }}>
+                    <label>Total Score (Max)</label>
+                    <input
+                      className="form-input"
+                      type="number"
+                      min="0"
+                      step="1"
+                      value={taskForm.maxScore}
+                      onChange={e => setTaskForm(f => ({ ...f, maxScore: e.target.value }))}
+                      placeholder="40"
+                    />
+                  </div>
                   <div className="auth-note" style={{ marginTop: 12, marginBottom: 16 }}>
                     Candidates can submit a written response + screen recording (up to 200 MB). Admin reviews and scores manually.
                   </div>
                   <button className="btn-primary" onClick={async () => {
                     if (!taskForm.title.trim() || !taskForm.description.trim() || !taskForm.deadline)
                       return notify("Title, description and deadline are required.", "error");
+                    const parsed = taskForm.maxScore === "" ? 40 : Number(taskForm.maxScore);
+                    if (!Number.isFinite(parsed) || parsed < 0)
+                      return notify("Total Score (Max) must be 0 or a positive number.", "error");
                     try {
                       await addDoc(collection(firestore, "tasks"), {
                         title: taskForm.title.trim(),
                         description: taskForm.description.trim(),
                         deadline: new Date(taskForm.deadline),
                         active: true,
+                        maxScore: Math.round(parsed),
                         createdBy: currentUser.id,
                         createdAt: serverTimestamp(),
                         submissionCount: 0,
                       });
-                      setTaskForm({ title: "", description: "", deadline: "" });
+                      setTaskForm({ title: "", description: "", deadline: "", maxScore: "40" });
                       notify("Task created.");
                     } catch (err) {
                       notify(err.message || "Could not create task.", "error");
@@ -1551,6 +1589,8 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
 
 // ─── Admin Scoring Modal ────────────────────────────────────────────────────
 function AdminScoringModal({ submission, user, task, onSave, onClose, onNavigate, navMeta }) {
+  const maxScoreRaw = Number(task?.maxScore);
+  const maxScore = Number.isFinite(maxScoreRaw) && maxScoreRaw >= 0 ? maxScoreRaw : 40;
   const [scores, setScores] = useState({
     taskScore: submission?.scores?.taskScore ?? 0,
     evaluationScore: submission?.scores?.evaluationScore ?? 0,
@@ -1558,8 +1598,11 @@ function AdminScoringModal({ submission, user, task, onSave, onClose, onNavigate
   const [feedback, setFeedback] = useState(submission?.feedback?.[0] || "");
   const [saving, setSaving] = useState(false);
 
-  const total = (Number(scores.taskScore) || 0) + (Number(scores.evaluationScore) || 0);
-  const skillLevel = getSkillLevel(total);
+  const baseMax = 30;
+  const rawTotal = (Number(scores.taskScore) || 0) + (Number(scores.evaluationScore) || 0);
+  const scaled = maxScore === 0 ? 0 : Math.round((rawTotal / baseMax) * maxScore);
+  const total = maxScore === 0 ? 0 : clampScore(scaled, maxScore);
+  const skillLevel = maxScore === 0 ? "No Score" : getSkillLevel(total, maxScore);
   const set = k => e => setScores(s => ({ ...s, [k]: clampScore(e.target.value, k === "taskScore" ? 20 : 10) }));
 
   const handleSave = async () => {
@@ -1602,23 +1645,29 @@ function AdminScoringModal({ submission, user, task, onSave, onClose, onNavigate
           )}
 
           {/* Scoring */}
-          {[
-            { label: "Task Completion Score", key: "taskScore", max: 20, hint: "Quality, correctness, depth of work" },
-            { label: "Evaluation / Critical Thinking", key: "evaluationScore", max: 10, hint: "Self-awareness, error identification, improvements" },
-          ].map(f => (
-            <div key={f.key} className="score-input-row">
-              <label>{f.label} <span className="max-hint">/ {f.max}</span></label>
-              <div className="score-hint">{f.hint}</div>
-              <div className="score-input-wrap">
-                <input type="range" min="0" max={f.max} value={scores[f.key]} onChange={set(f.key)} className="score-range" />
-                <input type="number" min="0" max={f.max} value={scores[f.key]} onChange={set(f.key)} className="score-num" />
-              </div>
+          {maxScore === 0 ? (
+            <div className="auth-note" style={{ marginTop: 8, marginBottom: 16 }}>
+              This task is configured as <b>No Score</b>. You can still review and leave feedback, and mark it as reviewed.
             </div>
-          ))}
+          ) : (
+            [
+              { label: "Task Completion Score", key: "taskScore", max: 20, hint: "Quality, correctness, depth of work" },
+              { label: "Evaluation / Critical Thinking", key: "evaluationScore", max: 10, hint: "Self-awareness, error identification, improvements" },
+            ].map(f => (
+              <div key={f.key} className="score-input-row">
+                <label>{f.label} <span className="max-hint">/ {f.max}</span></label>
+                <div className="score-hint">{f.hint}</div>
+                <div className="score-input-wrap">
+                  <input type="range" min="0" max={f.max} value={scores[f.key]} onChange={set(f.key)} className="score-range" />
+                  <input type="number" min="0" max={f.max} value={scores[f.key]} onChange={set(f.key)} className="score-num" />
+                </div>
+              </div>
+            ))
+          )}
 
           <div className="total-preview">
             <span>Total Score</span>
-            <span className="total-num">{total} / 40</span>
+            <span className="total-num">{total} / {maxScore}</span>
             <span className={`skill-badge skill-${skillLevel.toLowerCase()}`}>{skillLevel}</span>
           </div>
 
@@ -1641,7 +1690,7 @@ function AdminScoringModal({ submission, user, task, onSave, onClose, onNavigate
 }
 
 // ─── Submission Detail Modal ────────────────────────────────────────────────
-function SubmissionDetailModal({ submission, user, task, onScore, onClose, onNavigate, navMeta }) {
+function SubmissionDetailModal({ submission, user, task, onClose, onScore, onNavigate, navMeta }) {
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal modal-wide" onClick={e => e.stopPropagation()}>
@@ -1670,7 +1719,7 @@ function SubmissionDetailModal({ submission, user, task, onScore, onClose, onNav
               : <>
                   <span>Task: {submission.scores.taskScore}/20</span>
                   <span>Eval: {submission.scores.evaluationScore}/10</span>
-                  <span className="total-chip">Total: {submission.totalScore}/40</span>
+                  <span className="total-chip">Total: {formatScore(submission.totalScore, task?.maxScore)}</span>
                   <span className={`skill-badge skill-${submission.skillLevel.toLowerCase()}`}>{submission.skillLevel}</span>
                   <span>Source: admin</span>
                 </>}
@@ -1705,9 +1754,13 @@ function SubmissionDetailModal({ submission, user, task, onScore, onClose, onNav
 }
 
 // ─── Task Submissions Viewer (admin) ───────────────────────────────────────
-function TaskSubmissionsViewer({ task, db, onOpenSubmission, onClose }) {
-  const subs = db.taskSubmissions.filter(s => s.taskId === task.id)
-    .slice().sort((a, b) => b.totalScore - a.totalScore);
+function TaskSubmissionsViewer({ task, db, onClose, onOpenSubmission }) {
+  const subs = db.taskSubmissions
+    .filter(s => s.taskId === task.id)
+    .slice()
+    .sort((a, b) => b.totalScore - a.totalScore);
+
+  const safeMax = Number.isFinite(Number(task?.maxScore)) ? Number(task.maxScore) : 40;
   const topN = subs.length ? Math.max(1, Math.ceil(subs.length * 0.1)) : 0;
 
   return (
@@ -1743,7 +1796,7 @@ function TaskSubmissionsViewer({ task, db, onOpenSubmission, onClose }) {
                     <div className="task-admin-title">{user?.name || "Unknown"}</div>
                     <div className={`skill-badge skill-${s.skillLevel.toLowerCase()}`}>{s.skillLevel}</div>
                     <div style={{ textAlign:"right", fontFamily:"'IBM Plex Mono',monospace", fontWeight:900 }}>
-                      {s.evaluationSource === "pending" ? "—" : `${s.totalScore}/40`}
+                      {s.evaluationSource === "pending" ? "—" : formatScore(s.totalScore, safeMax)}
                     </div>
                     <div style={{ textAlign:"right" }}>
                       <button className="btn-primary sm" onClick={e => { e.stopPropagation(); onOpenSubmission(s); }}>Open</button>
