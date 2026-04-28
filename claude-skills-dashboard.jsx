@@ -22,6 +22,7 @@ import {
   updateDoc,
   writeBatch,
   addDoc,
+  getDoc,
 } from "firebase/firestore";
 
 // ─── Firebase bootstrap ────────────────────────────────────────────────────
@@ -777,6 +778,9 @@ function DailyTasksPage({ db, currentUser, setView, logout, notify }) {
     if (!textDraft.trim() && files.length === 0)
       return notify("Add a written response or at least one file before submitting.", "error");
 
+    const uid = firebaseAuth?.currentUser?.uid;
+    if (!uid) return notify("Session expired. Please re-login.", "error");
+
     setSubmitting(true);
     try {
       // Upload files first
@@ -789,9 +793,9 @@ function DailyTasksPage({ db, currentUser, setView, logout, notify }) {
       }
 
       // Write submission document (no AI evaluation — admin scores manually)
-      const subRef = await addDoc(collection(firestore, "task_submissions"), {
+      await addDoc(collection(firestore, "task_submissions"), {
         taskId: selectedTask.id,
-        userId: currentUser.id,
+        userId: uid,
         textAnswer: textDraft.trim(),
         files: uploadedFiles,
         scores: { promptScore: 0, taskScore: 0, evaluationScore: 0 },
@@ -805,18 +809,22 @@ function DailyTasksPage({ db, currentUser, setView, logout, notify }) {
       });
 
       // Placeholder leaderboard entry so admin can see it
-      await setDoc(
-        doc(firestore, "task_leaderboards", selectedTask.id, "entries", currentUser.id),
-        {
-          taskId: selectedTask.id,
-          userId: currentUser.id,
-          candidateName: currentUser.name,
-          totalScore: 0,
-          skillLevel: "Pending",
-          submittedAt: new Date().toISOString(),
-        },
-        { merge: true }
-      );
+      try {
+        const lbRef = doc(firestore, "task_leaderboards", selectedTask.id, "entries", uid);
+        const existing = await getDoc(lbRef);
+        if (!existing.exists()) {
+          await setDoc(lbRef, {
+            taskId: selectedTask.id,
+            userId: uid,
+            candidateName: currentUser.name,
+            totalScore: 0,
+            skillLevel: "Pending",
+            submittedAt: new Date().toISOString(),
+          });
+        }
+      } catch (e) {
+        throw new Error(`Leaderboard write failed: ${e?.message || "Missing or insufficient permissions"}`);
+      }
 
       localStorage.removeItem(`task_draft_${currentUser.id}_${selectedTask.id}`);
       notify("Task submitted! Awaiting admin review.");
