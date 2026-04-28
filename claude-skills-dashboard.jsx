@@ -792,44 +792,24 @@ function DailyTasksPage({ db, currentUser, setView, logout, notify }) {
           notify("Some files failed to upload but submission will proceed.", "error");
       }
 
-      // Write submission document (no AI evaluation — admin scores manually)
-      try {
-        await addDoc(collection(firestore, "task_submissions"), {
+      // Create submission server-side (firebase-admin) to avoid client-side permission issues
+      const idToken = await firebaseAuth.currentUser.getIdToken();
+      const res = await fetch("/api/task-submit", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({
           taskId: selectedTask.id,
-          userId: uid,
           textAnswer: textDraft.trim(),
           files: uploadedFiles,
-          scores: { promptScore: 0, taskScore: 0, evaluationScore: 0 },
-          totalScore: 0,
-          skillLevel: "Pending",
-          flags: [],
-          feedback: [],
-          evaluationSource: "pending",
-          submittedAt: serverTimestamp(),
-          submittedAtIso: new Date().toISOString(),
-        });
-      } catch (e) {
-        const extra = `uid=${uid} profileId=${currentUser?.id || ""}`.trim();
-        throw new Error(`Submission write failed: ${e?.code || ""} ${e?.message || "Missing or insufficient permissions"} (${extra})`.trim());
-      }
-
-      // Placeholder leaderboard entry so admin can see it
-      try {
-        const lbRef = doc(firestore, "task_leaderboards", selectedTask.id, "entries", uid);
-        const existing = await getDoc(lbRef);
-        if (!existing.exists()) {
-          await setDoc(lbRef, {
-            taskId: selectedTask.id,
-            userId: uid,
-            candidateName: currentUser.name,
-            totalScore: 0,
-            skillLevel: "Pending",
-            submittedAt: new Date().toISOString(),
-          });
-        }
-      } catch (e) {
-        throw new Error(`Leaderboard write failed: ${e?.code || ""} ${e?.message || "Missing or insufficient permissions"}`.trim());
-      }
+        }),
+      });
+      const text = await res.text();
+      let json;
+      try { json = JSON.parse(text); } catch { json = null; }
+      if (!res.ok) throw new Error(json?.error || "Could not submit task.");
 
       localStorage.removeItem(`task_draft_${currentUser.id}_${selectedTask.id}`);
       notify("Task submitted! Awaiting admin review.");
