@@ -23,13 +23,6 @@ import {
   writeBatch,
   addDoc,
 } from "firebase/firestore";
-import {
-  getStorage,
-  ref as storageRef,
-  uploadBytesResumable,
-  getDownloadURL,
-  deleteObject,
-} from "firebase/storage";
 
 // ─── Firebase bootstrap ────────────────────────────────────────────────────
 const FIREBASE_CONFIG = {
@@ -45,19 +38,12 @@ const firebaseReady = Boolean(
   FIREBASE_CONFIG.apiKey &&
   FIREBASE_CONFIG.authDomain &&
   FIREBASE_CONFIG.projectId &&
-  FIREBASE_CONFIG.storageBucket &&
   FIREBASE_CONFIG.appId
 );
 
 const firebaseApp = firebaseReady ? getApps()[0] || initializeApp(FIREBASE_CONFIG) : null;
 const firebaseAuth = firebaseApp ? getAuth(firebaseApp) : null;
 const firestore = firebaseApp ? getFirestore(firebaseApp) : null;
-const storage = firebaseApp ? getStorage(firebaseApp) : null;
-
-// Increase retry time for large file uploads on potentially unstable or slow connections
-if (storage) {
-  storage.maxUploadRetryTime = 600000; // 10 minutes
-}
 
 // ─── Constants ─────────────────────────────────────────────────────────────
 const MAX_FILE_BYTES = 200 * 1024 * 1024; // 200 MB
@@ -72,6 +58,25 @@ function formatBytes(bytes) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / 1048576).toFixed(1)} MB`;
+}
+
+async function getR2SignedViewUrl(objectKey) {
+  if (!firebaseAuth?.currentUser) throw new Error("Not authenticated");
+  const idToken = await firebaseAuth.currentUser.getIdToken();
+  const res = await fetch("/api/r2-get-url", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${idToken}`,
+    },
+    body: JSON.stringify({ key: objectKey }),
+  });
+  const text = await res.text();
+  let json;
+  try { json = JSON.parse(text); } catch { json = null; }
+  if (!res.ok) throw new Error(json?.error || "Could not load file");
+  if (!json?.url) throw new Error("Could not load file");
+  return json.url;
 }
 
 function getFileType(name = "") {
@@ -315,21 +320,30 @@ export default function App() {
 }
 
 // ─── Firebase setup notice ─────────────────────────────────────────────────
-function FirebaseSetupNotice() {
+function FirebaseSetupRequired() {
   return (
     <div className="auth-page">
-      <div className="auth-card wide">
+      <div className="auth-card">
         <div className="auth-logo">
           <div className="logo-icon">CA</div>
           <div>
             <h1 className="auth-title">Firebase Setup Required</h1>
-            <p className="auth-sub">Add env vars + enable Firebase Storage.</p>
+            <p className="auth-sub">Add env vars to connect Firebase.</p>
           </div>
         </div>
         <div className="setup-box">
           {["VITE_FIREBASE_API_KEY","VITE_FIREBASE_AUTH_DOMAIN","VITE_FIREBASE_PROJECT_ID",
-            "VITE_FIREBASE_STORAGE_BUCKET","VITE_FIREBASE_MESSAGING_SENDER_ID","VITE_FIREBASE_APP_ID"]
+            "VITE_FIREBASE_MESSAGING_SENDER_ID","VITE_FIREBASE_APP_ID"]
             .map(v => <code key={v}>{v}</code>)}
+        </div>
+      </div>
+      <div className="auth-hero">
+        <h2 className="hero-heading">Daily Tasks + Leaderboards</h2>
+        <p className="hero-body">Complete real CA case tasks, upload your screen recording or supporting documents, and get ranked by the admin panel. Track your performance across every task.</p>
+        <div className="hero-tags">
+          {["Screen Recordings","GST Reconciliation","Audit Tasks","Real-Time Leaderboard","Admin Scoring"].map(t => (
+            <span key={t} className="hero-tag">{t}</span>
+          ))}
         </div>
       </div>
     </div>
@@ -468,7 +482,7 @@ function SignupPage({ setView, notify }) {
 
 // ─── File Upload Hook ──────────────────────────────────────────────────────
 function useFileUpload({ userId, taskId, notify }) {
-  const [files, setFiles] = useState([]);  // { file, name, size, type, progress, url, error, storagePath }
+  const [files, setFiles] = useState([]);  // { file, name, size, type, progress, url, error, objectKey }
   const [uploading, setUploading] = useState(false);
 
   const validateFile = (file) => {
@@ -483,7 +497,7 @@ function useFileUpload({ userId, taskId, notify }) {
     for (const file of incoming) {
       const err = validateFile(file);
       if (err) { notify(err, "error"); continue; }
-      newEntries.push({ file, name: file.name, size: file.size, type: getFileType(file.name), progress: 0, url: null, error: null, storagePath: null });
+      newEntries.push({ file, name: file.name, size: file.size, type: getFileType(file.name), progress: 0, url: null, error: null, objectKey: null });
     }
     setFiles(prev => [...prev, ...newEntries]);
   }, [notify]);
@@ -491,44 +505,60 @@ function useFileUpload({ userId, taskId, notify }) {
   const removeFile = useCallback((index) => {
     setFiles(prev => {
       const entry = prev[index];
-      // Delete from Storage if already uploaded
-      if (entry?.storagePath && storage) {
-        deleteObject(storageRef(storage, entry.storagePath)).catch(() => {});
-      }
       return prev.filter((_, i) => i !== index);
     });
   }, []);
 
   const uploadAll = useCallback(async () => {
-    if (!storage || !userId || !taskId) throw new Error("Storage not configured");
+    if (!firebaseAuth?.currentUser || !userId || !taskId) throw new Error("Not authenticated");
     const pending = files.filter(f => !f.url && !f.error);
-    if (!pending.length) return files.filter(f => f.url).map(f => ({ name: f.name, url: f.url, size: f.size, type: f.type, storagePath: f.storagePath }));
+    if (!pending.length) return files.filter(f => f.url).map(f => ({ name: f.name, url: f.url, size: f.size, type: f.type, objectKey: f.objectKey }));
 
     setUploading(true);
 
-    // Use Firebase SDK resumable uploads for better performance + reliable progress events
-    const performResumableUpload = async (file, path, index) => {
-      const refObj = storageRef(storage, path);
-      const uploadTask = uploadBytesResumable(refObj, file, {
-        contentType: file.type || undefined,
+    const initSignedUpload = async (file) => {
+      const idToken = await firebaseAuth.currentUser.getIdToken();
+      const res = await fetch("/api/r2-upload-init", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({
+          taskId,
+          name: file.name,
+          size: file.size,
+          contentType: file.type || "application/octet-stream",
+        }),
       });
+      const text = await res.text();
+      let json;
+      try { json = JSON.parse(text); } catch { json = null; }
+      if (!res.ok) throw new Error(json?.error || "Could not initialize upload");
+      return json;
+    };
 
+    const uploadViaSignedUrl = async ({ uploadUrl, objectKey }, file, index) => {
       await new Promise((resolve, reject) => {
-        uploadTask.on(
-          "state_changed",
-          (snap) => {
-            const progress = snap.totalBytes ? Math.round((snap.bytesTransferred / snap.totalBytes) * 100) : 0;
-            setFiles(prev => prev.map((f, idx) => idx === index ? { ...f, progress } : f));
-          },
-          (err) => {
-            reject(err);
-          },
-          () => resolve()
-        );
+        const xhr = new XMLHttpRequest();
+        xhr.open("PUT", uploadUrl);
+        if (file.type) xhr.setRequestHeader("Content-Type", file.type);
+
+        xhr.upload.onprogress = (evt) => {
+          if (!evt.lengthComputable) return;
+          const progress = Math.round((evt.loaded / evt.total) * 100);
+          setFiles(prev => prev.map((f, idx) => idx === index ? { ...f, progress } : f));
+        };
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) return resolve();
+          reject(new Error(`Upload failed (${xhr.status})`));
+        };
+        xhr.onerror = () => reject(new Error("Upload failed. Check your connection."));
+        xhr.send(file);
       });
 
-      const url = await getDownloadURL(refObj);
-      return { url, storagePath: path };
+      const proxyUrl = `/api/r2-file?key=${encodeURIComponent(objectKey)}`;
+      return { url: proxyUrl, objectKey };
     };
 
     const finalResults = [];
@@ -540,9 +570,9 @@ function useFileUpload({ userId, taskId, notify }) {
       }
 
       try {
-        const path = `task_submissions/${taskId}/${userId}/${Date.now()}_${entry.name}`;
-        const { url, storagePath } = await performResumableUpload(entry.file, path, i);
-        const successEntry = { ...entry, url, storagePath, progress: 100 };
+        const init = await initSignedUpload(entry.file);
+        const { url, objectKey } = await uploadViaSignedUrl(init, entry.file, i);
+        const successEntry = { ...entry, url, objectKey, progress: 100 };
         setFiles(prev => prev.map((f, idx) => idx === i ? successEntry : f));
         finalResults.push(successEntry);
       } catch (err) {
@@ -554,7 +584,9 @@ function useFileUpload({ userId, taskId, notify }) {
     }
 
     setUploading(false);
-    return finalResults.filter(f => f.url).map(f => ({ name: f.name, url: f.url, size: f.size, type: f.type, storagePath: f.storagePath }));
+    return finalResults
+      .filter(f => f.url)
+      .map(f => ({ name: f.name, url: f.url, size: f.size, type: f.type, objectKey: f.objectKey }));
   }, [files, userId, taskId]);
 
   return { files, addFiles, removeFile, uploadAll, uploading, setFiles };
@@ -568,26 +600,74 @@ function FilePreview({ files }) {
       {files.map((f, i) => (
         <div key={i} className="preview-item">
           <div className="preview-label">{f.name}</div>
-          {f.type === "video" ? (
-            <video controls playsInline preload="metadata" className="video-player">
-              <source src={f.url} />
-              Your browser does not support the video tag.
-            </video>
-          ) : f.type === "document" && f.name.toLowerCase().endsWith(".pdf") ? (
-            <iframe src={`${f.url}#toolbar=0`} className="doc-viewer" title={f.name} />
-          ) : f.type === "document" && /\.(doc|docx|ppt|pptx|xls|xlsx)$/i.test(f.name || "") ? (
-            <iframe
-              src={`https://docs.google.com/gview?embedded=1&url=${encodeURIComponent(f.url)}`}
-              className="doc-viewer"
-              title={f.name}
-            />
-          ) : f.type === "image" ? (
-            <img src={f.url} alt={f.name} className="img-preview" />
-          ) : (
-            <div className="no-preview">Preview not available for this file type. <a href={f.url} target="_blank" rel="noreferrer">Download to view ↗</a></div>
-          )}
+          <ResolvedFileViewer file={f} />
         </div>
       ))}
+    </div>
+  );
+}
+
+function ResolvedFileViewer({ file }) {
+  const [url, setUrl] = useState(file?.url || null);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    let mounted = true;
+    setError(null);
+
+    // If we already have a full URL (e.g. old Firebase storage or already resolved), use it.
+    if (file?.url && /^https?:/i.test(file.url)) {
+      setUrl(file.url);
+      return;
+    }
+
+    // R2 objects: resolve signed URL at view-time.
+    if (file?.objectKey) {
+      setUrl(null);
+      getR2SignedViewUrl(file.objectKey)
+        .then(u => { if (mounted) setUrl(u); })
+        .catch(e => { if (mounted) setError(e?.message || "Could not load file"); });
+      return;
+    }
+
+    // Fallback to whatever was stored
+    setUrl(file?.url || null);
+    return () => { mounted = false; };
+  }, [file?.url, file?.objectKey]);
+
+  if (error) return <div className="no-preview">{error}</div>;
+  if (!url) return <div className="no-preview">Loading preview…</div>;
+
+  if (file.type === "video") {
+    return (
+      <video controls playsInline preload="metadata" className="video-player">
+        <source src={url} />
+        Your browser does not support the video tag.
+      </video>
+    );
+  }
+
+  if (file.type === "document" && String(file.name || "").toLowerCase().endsWith(".pdf")) {
+    return <iframe src={`${url}#toolbar=0`} className="doc-viewer" title={file.name} />;
+  }
+
+  if (file.type === "document" && /\.(doc|docx|ppt|pptx|xls|xlsx)$/i.test(file.name || "")) {
+    return (
+      <iframe
+        src={`https://docs.google.com/gview?embedded=1&url=${encodeURIComponent(url)}`}
+        className="doc-viewer"
+        title={file.name}
+      />
+    );
+  }
+
+  if (file.type === "image") {
+    return <img src={url} alt={file.name} className="img-preview" />;
+  }
+
+  return (
+    <div className="no-preview">
+      Preview not available for this file type. <a href={url} target="_blank" rel="noreferrer">Download to view ↗</a>
     </div>
   );
 }
