@@ -551,9 +551,14 @@ function useFileUpload({ userId, taskId, notify }) {
         };
         xhr.onload = () => {
           if (xhr.status >= 200 && xhr.status < 300) return resolve();
-          reject(new Error(`Upload failed (${xhr.status})`));
+          const body = (xhr.responseText || "").slice(0, 400);
+          reject(new Error(`Upload failed (${xhr.status}). ${body || ""}`.trim()));
         };
-        xhr.onerror = () => reject(new Error("Upload failed. Check your connection."));
+        xhr.onerror = () => {
+          // status 0 typically indicates network error or CORS preflight failure
+          reject(new Error("Upload failed (network/CORS). Check connection and R2 CORS settings."));
+        };
+        xhr.ontimeout = () => reject(new Error("Upload timed out. Please try again."));
         xhr.send(file);
       });
 

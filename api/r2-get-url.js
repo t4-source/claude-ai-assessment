@@ -78,6 +78,7 @@ function r2Client() {
   return new S3Client({
     region,
     endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
+    forcePathStyle: true,
     credentials: { accessKeyId, secretAccessKey },
   });
 }
