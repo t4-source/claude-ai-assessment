@@ -907,7 +907,7 @@ function LeaderboardsPage({ db, currentUser, setView, logout }) {
             </div>
             <div className="task-detail">
               {selectedTaskId
-                ? <TaskLeaderboard taskId={selectedTaskId} currentUser={currentUser} />
+                ? <TaskLeaderboard taskId={selectedTaskId} currentUser={currentUser} db={db} />
                 : <div className="card"><h3 className="card-title">Select a task</h3></div>}
             </div>
           </div>
@@ -918,7 +918,7 @@ function LeaderboardsPage({ db, currentUser, setView, logout }) {
 }
 
 // ─── Task Leaderboard component ────────────────────────────────────────────
-function TaskLeaderboard({ taskId, currentUser }) {
+function TaskLeaderboard({ taskId, currentUser, db }) {
   const [entries, setEntries] = useState([]);
 
   useEffect(() => {
@@ -945,9 +945,45 @@ function TaskLeaderboard({ taskId, currentUser }) {
   const topN = ranked.length ? Math.max(1, Math.ceil(ranked.length * 0.1)) : 0;
   const myRank = ranked.findIndex(r => r.userId === currentUser.id) + 1;
 
+  const exportCSV = () => {
+    if (!ranked.length) return;
+    const task = db?.tasks?.find(t => t.id === taskId);
+    const headers = ["Rank", "Candidate Name", "Skill Level", "Score"];
+    const rows = ranked.map((r, i) => [
+      `#${i + 1}`,
+      `"${r.candidateName.replace(/"/g, '""')}"`,
+      r.skillLevel,
+      `${r.totalScore}/40`
+    ]);
+
+    const csvContent = [
+      `Leaderboard Report: ${task?.title || taskId}`,
+      `Exported on: ${new Date().toLocaleString()}`,
+      "",
+      headers.join(","),
+      ...rows.map(e => e.join(","))
+    ].join("\n");
+
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.setAttribute("href", url);
+    link.setAttribute("download", `Leaderboard_${(task?.title || taskId).replace(/\s+/g, '_')}.csv`);
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
   return (
     <div className="card">
-      <h3 className="card-title">Leaderboard</h3>
+      <div className="card-header-flex">
+        <h3 className="card-title">Leaderboard</h3>
+        {ranked.length > 0 && currentUser.role === "admin" && (
+          <div style={{ display: "flex", gap: "8px" }}>
+            <button className="btn-outline sm" onClick={exportCSV}>📊 Excel</button>
+            <button className="btn-outline sm" onClick={() => window.print()}>📄 PDF</button>
+          </div>
+        )}
+      </div>
       <p className="muted" style={{ marginBottom: 14 }}>Admin-scored • Top 10% highlighted</p>
       {!ranked.length ? (
         <div className="empty-chart">No scored submissions yet</div>
@@ -1152,6 +1188,10 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
               <div><h2 className="page-title">All Submissions</h2>
                 <p className="page-sub">{allSubs.length} total • {allSubs.filter(s => s.evaluationSource === "pending").length} pending review</p>
               </div>
+              <div style={{ display: "flex", gap: "8px" }}>
+                <button className="btn-outline sm" onClick={exportAllScoresCSV}>📊 Export All Excel</button>
+                <button className="btn-outline sm" onClick={() => window.print()}>📄 Print Report</button>
+              </div>
             </div>
             <div className="candidate-list">
               {allSubs.map((s, i) => {
@@ -1209,7 +1249,7 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
               </div>
             )}
             {lbTaskId
-              ? <TaskLeaderboard taskId={lbTaskId} currentUser={currentUser} />
+              ? <TaskLeaderboard taskId={lbTaskId} currentUser={currentUser} db={db} />
               : <div className="empty-state"><div className="empty-icon">🏆</div><h3>Pick a task above</h3></div>}
           </>
         )}
@@ -1738,6 +1778,8 @@ function CSS() {
     .stat-icon { font-size: 20px; margin-bottom: 6px; }
 
     .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 24px; margin-bottom: 20px; box-shadow: var(--shadow); }
+    .card-header-flex { display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; }
+    .card-header-flex .card-title { margin-bottom: 0; }
     .card-title { font-size: 14px; font-weight: 800; text-transform: uppercase; letter-spacing: .08em; color: var(--accent); margin-bottom: 18px; }
     .two-col { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; margin-bottom: 20px; }
     .muted { color: var(--muted); font-size: 14px; }
@@ -1911,6 +1953,16 @@ function CSS() {
       .task-lb-head, .task-lb-row { grid-template-columns: 50px 1fr 100px 80px; }
       .auth-hero { display: none; }
       .auth-card { width: 100%; min-width: unset; }
+    }
+
+    @media print {
+      .sidebar, .btn-primary, .btn-outline, .btn-submit, .btn-danger, .btn-score, .toast, .modal-overlay, .filter-bar, .page-header div:last-child, .card-header-flex div:last-child { display: none !important; }
+      .main-layout { display: block; }
+      .content-area { padding: 0; max-width: 100%; }
+      .card { box-shadow: none; border: 1px solid var(--border); break-inside: avoid; }
+      .task-card, .candidate-row, .task-lb-row { break-inside: avoid; }
+      body { background: #fff; }
+      .page-title::after { content: ' - Platform Report'; }
     }
   `;
 }
