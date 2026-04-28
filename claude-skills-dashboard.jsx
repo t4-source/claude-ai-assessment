@@ -4,6 +4,7 @@ import {
   createUserWithEmailAndPassword,
   getAuth,
   onAuthStateChanged,
+  sendPasswordResetEmail,
   signInWithEmailAndPassword,
   signOut,
   updateProfile,
@@ -366,6 +367,9 @@ function LoginPage({ setView, notify }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
+  const [resetOpen, setResetOpen] = useState(false);
+  const [resetEmail, setResetEmail] = useState("");
+  const [resetLoading, setResetLoading] = useState(false);
 
   const handleLogin = async () => {
     if (!email.trim() || !password) return notify("Email and password are required.", "error");
@@ -376,6 +380,21 @@ function LoginPage({ setView, notify }) {
       notify(err.message || "Invalid credentials.", "error");
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleResetPassword = async () => {
+    if (!resetEmail.trim()) return notify("Enter your email address.", "error");
+    setResetLoading(true);
+    try {
+      await sendPasswordResetEmail(firebaseAuth, resetEmail.trim());
+      notify("Password reset email sent. Please check your inbox.");
+      setResetOpen(false);
+      setResetEmail("");
+    } catch (err) {
+      notify(err.message || "Could not send password reset email.", "error");
+    } finally {
+      setResetLoading(false);
     }
   };
 
@@ -406,7 +425,12 @@ function LoginPage({ setView, notify }) {
         <button className="btn-primary" onClick={handleLogin} disabled={loading}>
           {loading ? <span className="spinner" /> : "Sign In"}
         </button>
-        <p className="auth-link">No account? <button onClick={() => setView("signup")}>Create one</button></p>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <button className="link-btn" onClick={() => { setResetEmail(email || ""); setResetOpen(true); }}>
+            Forgot password?
+          </button>
+          <p className="auth-link" style={{ margin: 0 }}>No account? <button onClick={() => setView("signup")}>Create one</button></p>
+        </div>
       </div>
       <div className="auth-hero">
         <h2 className="hero-heading">Code. Control. CA</h2>
@@ -417,6 +441,38 @@ function LoginPage({ setView, notify }) {
           ))}
         </div>
       </div>
+
+      {resetOpen && (
+        <div className="modal-overlay" onClick={() => !resetLoading && setResetOpen(false)}>
+          <div className="modal" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <div>
+                <h3>Reset password</h3>
+                <div className="modal-sub">We’ll email you a link to reset your password.</div>
+              </div>
+              <button className="close-btn" onClick={() => !resetLoading && setResetOpen(false)}>✕</button>
+            </div>
+            <div className="modal-body">
+              <div className="form-group">
+                <label>Email</label>
+                <input
+                  className="form-input"
+                  type="email"
+                  value={resetEmail}
+                  onChange={e => setResetEmail(e.target.value)}
+                  onKeyDown={e => e.key === "Enter" && handleResetPassword()}
+                />
+              </div>
+            </div>
+            <div className="modal-footer">
+              <button className="btn-outline" onClick={() => !resetLoading && setResetOpen(false)} disabled={resetLoading}>Cancel</button>
+              <button className="btn-primary" onClick={handleResetPassword} disabled={resetLoading}>
+                {resetLoading ? "Sending…" : "Send reset email"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
