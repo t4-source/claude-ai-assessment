@@ -392,7 +392,7 @@ function LoginPage({ setView, notify }) {
         <div className="form-group">
           <label>Email</label>
           <input className="form-input" type="email" value={email}
-            onChange={e => setEmail(e.target.value)} placeholder="you@example.com"
+            onChange={e => setEmail(e.target.value)}
             onKeyDown={e => e.key === "Enter" && handleLogin()} />
         </div>
         <div className="form-group">
@@ -400,7 +400,7 @@ function LoginPage({ setView, notify }) {
           <input className="form-input" type="password" value={password}
             name="new-password"
             autoComplete="new-password"
-            onChange={e => setPassword(e.target.value)} placeholder="••••••••"
+            onChange={e => setPassword(e.target.value)}
             onKeyDown={e => e.key === "Enter" && handleLogin()} />
         </div>
         <button className="btn-primary" onClick={handleLogin} disabled={loading}>
