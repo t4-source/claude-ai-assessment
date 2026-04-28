@@ -1214,6 +1214,39 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
   const skillDist = { Beginner: 0, Intermediate: 0, Advanced: 0, Pending: 0 };
   allSubs.forEach(s => { if (s.skillLevel in skillDist) skillDist[s.skillLevel]++; });
 
+  const exportAllScoresCSV = () => {
+    if (!allSubs.length) return;
+    const headers = ["Submitted At", "Task", "Candidate", "Email", "Status", "Skill Level", "Score"];
+    const rows = allSubs.map(s => {
+      const user = db.users.find(u => u.id === s.userId);
+      const task = db.tasks.find(t => t.id === s.taskId);
+      const submittedAt = s.submittedAt ? new Date(s.submittedAt).toISOString() : (s.submittedAtIso || "");
+      const status = s.evaluationSource === "pending" ? "Pending" : "Scored";
+      const score = s.evaluationSource === "pending" ? "" : String(s.totalScore ?? "");
+      const email = user?.email || "";
+      const name = user?.name || "Unknown";
+      const taskTitle = task?.title || s.taskId;
+      return [
+        submittedAt,
+        `"${String(taskTitle).replace(/"/g, '""')}"`,
+        `"${String(name).replace(/"/g, '""')}"`,
+        `"${String(email).replace(/"/g, '""')}"`,
+        status,
+        s.skillLevel || "",
+        score,
+      ];
+    });
+
+    const csv = [headers.join(","), ...rows.map(r => r.join(","))].join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.setAttribute("href", url);
+    link.setAttribute("download", `All_Submissions_${new Date().toISOString().slice(0,10)}.csv`);
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
   const saveScores = async (submission, scores, feedback) => {
     const total = scores.taskScore + scores.evaluationScore;
     const skillLevel = getSkillLevel(total);
