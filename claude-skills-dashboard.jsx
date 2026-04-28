@@ -793,20 +793,25 @@ function DailyTasksPage({ db, currentUser, setView, logout, notify }) {
       }
 
       // Write submission document (no AI evaluation — admin scores manually)
-      await addDoc(collection(firestore, "task_submissions"), {
-        taskId: selectedTask.id,
-        userId: uid,
-        textAnswer: textDraft.trim(),
-        files: uploadedFiles,
-        scores: { promptScore: 0, taskScore: 0, evaluationScore: 0 },
-        totalScore: 0,
-        skillLevel: "Pending",
-        flags: [],
-        feedback: [],
-        evaluationSource: "pending",
-        submittedAt: serverTimestamp(),
-        submittedAtIso: new Date().toISOString(),
-      });
+      try {
+        await addDoc(collection(firestore, "task_submissions"), {
+          taskId: selectedTask.id,
+          userId: uid,
+          textAnswer: textDraft.trim(),
+          files: uploadedFiles,
+          scores: { promptScore: 0, taskScore: 0, evaluationScore: 0 },
+          totalScore: 0,
+          skillLevel: "Pending",
+          flags: [],
+          feedback: [],
+          evaluationSource: "pending",
+          submittedAt: serverTimestamp(),
+          submittedAtIso: new Date().toISOString(),
+        });
+      } catch (e) {
+        const extra = `uid=${uid} profileId=${currentUser?.id || ""}`.trim();
+        throw new Error(`Submission write failed: ${e?.code || ""} ${e?.message || "Missing or insufficient permissions"} (${extra})`.trim());
+      }
 
       // Placeholder leaderboard entry so admin can see it
       try {
@@ -823,7 +828,7 @@ function DailyTasksPage({ db, currentUser, setView, logout, notify }) {
           });
         }
       } catch (e) {
-        throw new Error(`Leaderboard write failed: ${e?.message || "Missing or insufficient permissions"}`);
+        throw new Error(`Leaderboard write failed: ${e?.code || ""} ${e?.message || "Missing or insufficient permissions"}`.trim());
       }
 
       localStorage.removeItem(`task_draft_${currentUser.id}_${selectedTask.id}`);
@@ -1176,6 +1181,9 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
   const [taskViewer, setTaskViewer] = useState(null);       // task doc
   const [lbTaskId, setLbTaskId] = useState("");
 
+  const candidates = db.users.filter(u => u.role === "candidate");
+  const allSubs = db.taskSubmissions;
+
   // Navigation logic for 100+ candidates
   const currentSubsList = tab === "submissions" ? allSubs : allSubs.filter(s => s.evaluationSource === "pending");
   
@@ -1199,8 +1207,6 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
     return `${idx + 1} of ${currentSubsList.length}`;
   };
 
-  const candidates = db.users.filter(u => u.role === "candidate");
-  const allSubs = db.taskSubmissions;
   const scoredSubs = allSubs.filter(s => s.evaluationSource !== "pending");
   const avgScore = scoredSubs.length
     ? Math.round(scoredSubs.reduce((a, s) => a + s.totalScore, 0) / scoredSubs.length) : 0;
