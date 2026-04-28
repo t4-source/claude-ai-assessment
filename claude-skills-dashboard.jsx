@@ -336,7 +336,7 @@ function FirebaseSetupRequired() {
     <div className="auth-page">
       <div className="auth-card">
         <div className="auth-logo">
-          <div className="logo-icon">CA</div>
+          <div className="logo-icon">CCA</div>
           <div>
             <h1 className="auth-title">Firebase Setup Required</h1>
             <p className="auth-sub">Add env vars to connect Firebase.</p>
@@ -383,10 +383,10 @@ function LoginPage({ setView, notify }) {
     <div className="auth-page">
       <div className="auth-card">
         <div className="auth-logo">
-          <div className="logo-icon">CA</div>
+          <div className="logo-icon">CCA</div>
           <div>
-            <h1 className="auth-title">Daily Task Platform</h1>
-            <p className="auth-sub">Chartered Accountant • AI Task Submissions</p>
+            <h1 className="auth-title">Task Submission Platform</h1>
+            <p className="auth-sub">AI Task Submissions</p>
           </div>
         </div>
         <div className="form-group">
@@ -398,6 +398,8 @@ function LoginPage({ setView, notify }) {
         <div className="form-group">
           <label>Password</label>
           <input className="form-input" type="password" value={password}
+            name="new-password"
+            autoComplete="new-password"
             onChange={e => setPassword(e.target.value)} placeholder="••••••••"
             onKeyDown={e => e.key === "Enter" && handleLogin()} />
         </div>
@@ -407,10 +409,10 @@ function LoginPage({ setView, notify }) {
         <p className="auth-link">No account? <button onClick={() => setView("signup")}>Create one</button></p>
       </div>
       <div className="auth-hero">
-        <h2 className="hero-heading">Submit. Record. Get Ranked.</h2>
-        <p className="hero-body">Complete real CA case tasks, upload your screen recording or supporting documents, and get ranked by the admin panel. Track your performance across every task.</p>
+        <h2 className="hero-heading">Code. Control. CA</h2>
+        <p className="hero-body">Complete the tasks, upload your screen recordings or supporting documents, and get ranked through the admin panel. Track your performance across every task.</p>
         <div className="hero-tags">
-          {["Screen Recordings","GST Reconciliation","Audit Tasks","Real-Time Leaderboard","Admin Scoring"].map(t => (
+          {["Case-Based Submissions","Structured Review","Secure File Uploads","Performance Tracking","Admin Oversight"].map(t => (
             <span key={t} className="hero-tag">{t}</span>
           ))}
         </div>
@@ -456,13 +458,13 @@ function SignupPage({ setView, notify }) {
       <div className="auth-card wide">
         <button className="back-btn" onClick={() => setView("login")}>← Back</button>
         <div className="auth-logo">
-          <div className="logo-icon">CA</div>
+          <div className="logo-icon">CCA</div>
           <div><h1 className="auth-title">Create Account</h1><p className="auth-sub">Join the platform</p></div>
         </div>
         {[["Full Name","name","text","Priya Sharma"],["Email","email","email","priya@example.com"],["Password","password","password","••••••••"]]
-          .map(([lbl,key,type,ph]) => (
+          .map(([label,key,type,ph]) => (
             <div className="form-group" key={key}>
-              <label>{lbl}</label>
+              <label>{label}</label>
               <input className="form-input" type={type} value={form[key]} onChange={set(key)} placeholder={ph} />
             </div>
           ))}
@@ -1829,8 +1831,8 @@ function Sidebar({ role, current, setView, logout, user }) {
   return (
     <div className="sidebar">
       <div className="sidebar-logo">
-        <div className="logo-icon sm">CA</div>
-        <div><div className="sidebar-brand">Task Platform</div><div className="sidebar-sub">Daily CA Tasks</div></div>
+        <div className="logo-icon sm">CCA</div>
+        <div><div className="sidebar-brand">Task Submission Platform</div><div className="sidebar-sub">AI Task Submissions</div></div>
       </div>
       <nav className="sidebar-nav">
         {links.map(l => (
