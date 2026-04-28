@@ -139,11 +139,12 @@ function normalizeTaskSubmission(id, data = {}) {
     files: Array.isArray(data.files) ? data.files : [],
     scores,
     totalScore,
-    skillLevel: data.skillLevel || getSkillLevel(totalScore),
+    skillLevel: data.skillLevel || (data.evaluationSource === "pending" ? "Pending" : getSkillLevel(totalScore)),
     flags: Array.isArray(data.flags) ? data.flags : [],
     feedback: Array.isArray(data.feedback) ? data.feedback : [],
     submittedAt: getIsoDate(data.submittedAt) || data.submittedAtIso || "",
     scoredAt: getIsoDate(data.scoredAt) || "",
+    submittedAtMs: data.submittedAt?.toMillis?.() || (data.submittedAtIso ? new Date(data.submittedAtIso).getTime() : 0),
     evaluationSource: data.evaluationSource || "pending",
   };
 }
@@ -428,7 +429,7 @@ function SignupPage({ setView, notify }) {
 }
 
 // ─── File Upload Hook ──────────────────────────────────────────────────────
-function useFileUpload({ userId, taskId }) {
+function useFileUpload({ userId, taskId, notify }) {
   const [files, setFiles] = useState([]);  // { file, name, size, type, progress, url, error, storagePath }
   const [uploading, setUploading] = useState(false);
 
@@ -443,11 +444,11 @@ function useFileUpload({ userId, taskId }) {
     const newEntries = [];
     for (const file of incoming) {
       const err = validateFile(file);
-      if (err) { alert(err); continue; }
+      if (err) { notify(err, "error"); continue; }
       newEntries.push({ file, name: file.name, size: file.size, type: getFileType(file.name), progress: 0, url: null, error: null, storagePath: null });
     }
     setFiles(prev => [...prev, ...newEntries]);
-  }, []);
+  }, [notify]);
 
   const removeFile = useCallback((index) => {
     setFiles(prev => {
@@ -497,6 +498,32 @@ function useFileUpload({ userId, taskId }) {
   }, [files, userId, taskId]);
 
   return { files, addFiles, removeFile, uploadAll, uploading, setFiles };
+}
+
+// ─── File Preview Component ────────────────────────────────────────────────
+function FilePreview({ files }) {
+  if (!files?.length) return null;
+  return (
+    <div className="preview-container">
+      {files.map((f, i) => (
+        <div key={i} className="preview-item">
+          <div className="preview-label">{f.name}</div>
+          {f.type === "video" ? (
+            <video controls className="video-player">
+              <source src={f.url} />
+              Your browser does not support the video tag.
+            </video>
+          ) : f.type === "document" && f.name.toLowerCase().endsWith(".pdf") ? (
+            <iframe src={`${f.url}#toolbar=0`} className="doc-viewer" title={f.name} />
+          ) : f.type === "image" ? (
+            <img src={f.url} alt={f.name} className="img-preview" />
+          ) : (
+            <div className="no-preview">Preview not available for this file type. <a href={f.url} target="_blank" rel="noreferrer">Download to view ↗</a></div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
 }
 
 // ─── File Drop Zone ────────────────────────────────────────────────────────
@@ -579,6 +606,7 @@ function DailyTasksPage({ db, currentUser, setView, logout, notify }) {
   const { files, addFiles, removeFile, uploadAll, uploading } = useFileUpload({
     userId: currentUser.id,
     taskId: selectedTaskId,
+    notify,
   });
 
   // Restore text draft from localStorage
@@ -953,6 +981,29 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
   const [taskViewer, setTaskViewer] = useState(null);       // task doc
   const [lbTaskId, setLbTaskId] = useState("");
 
+  // Navigation logic for 100+ candidates
+  const currentSubsList = tab === "submissions" ? allSubs : allSubs.filter(s => s.evaluationSource === "pending");
+  
+  const navigateSub = (direction) => {
+    const current = scoringModal || detailModal;
+    if (!current) return;
+    const idx = currentSubsList.findIndex(s => s.id === current.id);
+    const nextIdx = idx + direction;
+    if (nextIdx >= 0 && nextIdx < currentSubsList.length) {
+      const nextSub = currentSubsList[nextIdx];
+      if (scoringModal) setScoringModal(nextSub);
+      if (detailModal) setDetailModal(nextSub);
+    } else {
+      notify("No more submissions in this direction.");
+    }
+  };
+
+  const getNavMeta = (currentSub) => {
+    if (!currentSub) return "";
+    const idx = currentSubsList.findIndex(s => s.id === currentSub.id);
+    return `${idx + 1} of ${currentSubsList.length}`;
+  };
+
   const candidates = db.users.filter(u => u.role === "candidate");
   const allSubs = db.taskSubmissions;
   const scoredSubs = allSubs.filter(s => s.evaluationSource !== "pending");
@@ -1011,6 +1062,8 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
             task={db.tasks.find(t => t.id === scoringModal.taskId)}
             onSave={saveScores}
             onClose={() => setScoringModal(null)}
+            onNavigate={navigateSub}
+            navMeta={getNavMeta(scoringModal)}
           />
         )}
 
@@ -1021,6 +1074,8 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
             task={db.tasks.find(t => t.id === detailModal.taskId)}
             onScore={() => { setScoringModal(detailModal); setDetailModal(null); }}
             onClose={() => setDetailModal(null)}
+            onNavigate={navigateSub}
+            navMeta={getNavMeta(detailModal)}
           />
         )}
 
@@ -1277,7 +1332,7 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
 }
 
 // ─── Admin Scoring Modal ────────────────────────────────────────────────────
-function AdminScoringModal({ submission, user, task, onSave, onClose }) {
+function AdminScoringModal({ submission, user, task, onSave, onClose, onNavigate, navMeta }) {
   const [scores, setScores] = useState({
     taskScore: submission?.scores?.taskScore ?? 0,
     evaluationScore: submission?.scores?.evaluationScore ?? 0,
@@ -1306,22 +1361,17 @@ function AdminScoringModal({ submission, user, task, onSave, onClose }) {
           <button className="close-btn" onClick={onClose}>✕</button>
         </div>
         <div className="modal-body scrollable">
-          {/* Files preview */}
+          <div className="nav-row">
+            <button className="btn-outline sm" onClick={() => onNavigate(-1)}>← Previous</button>
+            <span className="nav-meta">{navMeta}</span>
+            <button className="btn-outline sm" onClick={() => onNavigate(1)}>Next →</button>
+          </div>
+
+          {/* Files integrated preview */}
           {submission.files?.length > 0 && (
             <div>
-              <div className="answer-label" style={{ marginBottom: 8 }}>Submitted Files</div>
-              <div className="file-list">
-                {submission.files.map((f, i) => (
-                  <div key={i} className="file-item file-done">
-                    <div className="file-icon">{f.type === "video" ? "🎥" : f.type === "image" ? "🖼" : "📄"}</div>
-                    <div className="file-info">
-                      <div className="file-name">{f.name}</div>
-                      <div className="file-meta">{formatBytes(f.size)}</div>
-                    </div>
-                    <a href={f.url} target="_blank" rel="noreferrer" className="file-view-btn">Open ↗</a>
-                  </div>
-                ))}
-              </div>
+              <div className="answer-label" style={{ marginBottom: 12 }}>Submission Preview</div>
+              <FilePreview files={submission.files} />
             </div>
           )}
 
@@ -1373,7 +1423,7 @@ function AdminScoringModal({ submission, user, task, onSave, onClose }) {
 }
 
 // ─── Submission Detail Modal ────────────────────────────────────────────────
-function SubmissionDetailModal({ submission, user, task, onScore, onClose }) {
+function SubmissionDetailModal({ submission, user, task, onScore, onClose, onNavigate, navMeta }) {
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal modal-wide" onClick={e => e.stopPropagation()}>
@@ -1390,6 +1440,12 @@ function SubmissionDetailModal({ submission, user, task, onScore, onClose }) {
           </div>
         </div>
         <div className="modal-body scrollable">
+          <div className="nav-row">
+            <button className="btn-outline sm" onClick={() => onNavigate(-1)}>← Previous</button>
+            <span className="nav-meta">{navMeta}</span>
+            <button className="btn-outline sm" onClick={() => onNavigate(1)}>Next →</button>
+          </div>
+
           <div className="score-chips-row">
             {submission.evaluationSource === "pending"
               ? <span className="pending-chip">⏳ Awaiting review</span>
@@ -1413,19 +1469,8 @@ function SubmissionDetailModal({ submission, user, task, onScore, onClose }) {
 
           {submission.files?.length > 0 && (
             <div>
-              <div className="answer-label" style={{ marginBottom: 8 }}>Submitted Files</div>
-              <div className="file-list">
-                {submission.files.map((f, i) => (
-                  <div key={i} className="file-item file-done">
-                    <div className="file-icon">{f.type === "video" ? "🎥" : f.type === "image" ? "🖼" : "📄"}</div>
-                    <div className="file-info">
-                      <div className="file-name">{f.name}</div>
-                      <div className="file-meta">{formatBytes(f.size)}</div>
-                    </div>
-                    <a href={f.url} target="_blank" rel="noreferrer" className="file-view-btn">Open ↗</a>
-                  </div>
-                ))}
-              </div>
+              <div className="answer-label" style={{ marginBottom: 12 }}>Submission Preview</div>
+              <FilePreview files={submission.files} />
             </div>
           )}
 
@@ -1575,7 +1620,7 @@ function CSS() {
     :root {
       --bg: #f5f7fb; --surface: #ffffff; --card: #ffffff; --subtle: #f8fafc;
       --border: #d9e1ec; --border-strong: #b7c3d4; --text: #142033; --muted: #66758a;
-      --accent: #173b63; --accent2: #2f5f8f; --green: #1f7a4d; --red: #b42318;
+      --accent: #0f172a; --accent2: #1e293b; --green: #059669; --red: #dc2626;
       --yellow: #a15c07; --blue: #245b91; --shadow: 0 12px 30px rgba(20,32,51,0.08);
     }
     body { background: var(--bg); color: var(--text); font-family: 'Source Sans 3', sans-serif; font-size: 16px; }
@@ -1612,8 +1657,8 @@ function CSS() {
     .form-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
 
     /* Buttons */
-    .btn-primary { padding: 12px 20px; background: var(--accent); color: #fff; border: none; border-radius: 8px; font-weight: 800; font-size: 15px; cursor: pointer; font-family: 'Source Sans 3', sans-serif; display: flex; align-items: center; justify-content: center; gap: 8px; transition: opacity .2s; }
-    .btn-primary:hover { opacity: .88; }
+    .btn-primary { padding: 12px 20px; background: var(--accent); color: #fff; border: none; border-radius: 8px; font-weight: 800; font-size: 15px; cursor: pointer; font-family: 'Source Sans 3', sans-serif; display: flex; align-items: center; justify-content: center; gap: 8px; transition: all .2s; }
+    .btn-primary:hover { background: #000; transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
     .btn-primary:disabled { opacity: .5; cursor: not-allowed; }
     .btn-primary.sm { padding: 8px 14px; font-size: 13px; }
     .btn-outline { padding: 11px 20px; border: 1px solid var(--border-strong); background: #fff; color: var(--accent); border-radius: 8px; font-weight: 800; font-size: 15px; cursor: pointer; font-family: 'Source Sans 3', sans-serif; transition: background .2s; }
@@ -1652,12 +1697,31 @@ function CSS() {
     .user-name { font-size: 14px; font-weight: 800; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .user-role { font-size: 11px; color: var(--muted); text-transform: uppercase; }
     .logout-btn { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 18px; padding: 4px; }
+    
+    .nav-row { display: flex; align-items: center; justify-content: center; gap: 20px; padding: 12px; background: var(--subtle); border-radius: 12px; margin-bottom: 20px; border: 1px solid var(--border); }
+    .nav-meta { font-family: 'IBM Plex Mono', monospace; font-weight: 700; color: var(--accent); font-size: 14px; }
 
     .content-area { flex: 1; padding: 36px 40px 56px; overflow-y: auto; max-width: 1300px; }
     .page-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 28px; }
     .page-title { font-size: 32px; font-weight: 800; color: var(--text); letter-spacing: -0.03em; }
     .page-sub { font-size: 15px; color: var(--muted); margin-top: 4px; }
     .header-badge { padding: 6px 14px; background: rgba(239,68,68,.12); color: var(--red); border-radius: 20px; font-size: 12px; font-weight: 700; border: 1px solid rgba(239,68,68,.25); }
+
+    /* Previewer */
+    .preview-container { display: flex; flex-direction: column; gap: 24px; background: #000; border-radius: 14px; overflow: hidden; border: 1px solid var(--accent); }
+    .preview-item { display: flex; flex-direction: column; }
+    .preview-label { background: var(--accent2); color: #fff; padding: 8px 16px; font-size: 12px; font-weight: 700; font-family: 'IBM Plex Mono', monospace; }
+    .video-player { width: 100%; max-height: 500px; outline: none; background: #000; }
+    .doc-viewer { width: 100%; height: 600px; border: none; background: #fff; }
+    .img-preview { width: 100%; height: auto; display: block; }
+    .no-preview { padding: 40px; text-align: center; color: #fff; font-size: 14px; }
+    .no-preview a { color: #60a5fa; text-decoration: none; font-weight: 700; }
+
+    /* Animated Progress */
+    .file-progress-bar { 
+      background: linear-gradient(90deg, var(--blue), #60a5fa);
+      box-shadow: 0 0 10px rgba(96,165,250,0.5);
+    }
 
     /* Stats */
     .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px,1fr)); gap: 16px; margin-bottom: 24px; }
