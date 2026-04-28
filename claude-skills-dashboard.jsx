@@ -54,6 +54,11 @@ const firebaseAuth = firebaseApp ? getAuth(firebaseApp) : null;
 const firestore = firebaseApp ? getFirestore(firebaseApp) : null;
 const storage = firebaseApp ? getStorage(firebaseApp) : null;
 
+// Increase retry time for large file uploads on potentially unstable or slow connections
+if (storage) {
+  storage.maxUploadRetryTime = 600000; // 10 minutes
+}
+
 // ─── Constants ─────────────────────────────────────────────────────────────
 const MAX_FILE_BYTES = 200 * 1024 * 1024; // 200 MB
 const ALLOWED_MIME_PREFIXES = ["video/", "image/", "application/pdf", "application/"];
@@ -157,12 +162,26 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState(null);
   const [view, setView] = useState("login");
   const [notification, setNotification] = useState(null);
+  const [centerMessage, setCenterMessage] = useState(null); // { msg, type }
   const [authReady, setAuthReady] = useState(!firebaseReady);
   const db = { users, tasks, taskSubmissions };
 
   const notify = useCallback((msg, type = "success") => {
     setNotification({ msg, type });
     setTimeout(() => setNotification(null), 4000);
+
+    // Escalate important upload/validation errors to a centered modal for clarity
+    if (type === "error") {
+      const m = String(msg || "");
+      if (
+        /exceeds\s+200\s*mb/i.test(m) ||
+        /unsupported file type/i.test(m) ||
+        /upload/i.test(m) ||
+        /stalled/i.test(m)
+      ) {
+        setCenterMessage({ msg, type });
+      }
+    }
   }, []);
 
   // Auth listener
@@ -255,6 +274,25 @@ export default function App() {
   return (
     <div className="app-root">
       <style>{CSS()}</style>
+      {centerMessage && (
+        <div className="modal-overlay" onClick={() => setCenterMessage(null)}>
+          <div className="modal modal-centered" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <div>
+                <h3>{centerMessage.type === "error" ? "Upload Error" : "Message"}</h3>
+                <div className="modal-sub">Please fix the issue and try again.</div>
+              </div>
+              <button className="close-btn" onClick={() => setCenterMessage(null)}>✕</button>
+            </div>
+            <div className="modal-body">
+              <div className="center-msg">{centerMessage.msg}</div>
+            </div>
+            <div className="modal-footer">
+              <button className="btn-primary" onClick={() => setCenterMessage(null)}>OK</button>
+            </div>
+          </div>
+        </div>
+      )}
       {notification && (
         <div className={`toast toast-${notification.type}`}>
           <span>{notification.type === "success" ? "✓" : notification.type === "error" ? "✗" : "ℹ"}</span>
@@ -467,34 +505,56 @@ function useFileUpload({ userId, taskId, notify }) {
     if (!pending.length) return files.filter(f => f.url).map(f => ({ name: f.name, url: f.url, size: f.size, type: f.type, storagePath: f.storagePath }));
 
     setUploading(true);
-    const results = await Promise.all(
-      files.map((entry, index) => {
-        if (entry.url) return Promise.resolve(entry);
-        if (!entry.file) return Promise.resolve(entry);
-        return new Promise((resolve) => {
-          const path = `task_submissions/${taskId}/${userId}/${Date.now()}_${entry.name}`;
-          const ref = storageRef(storage, path);
-          const task = uploadBytesResumable(ref, entry.file);
-          task.on("state_changed",
-            snap => {
-              const progress = Math.round((snap.bytesTransferred / snap.totalBytes) * 100);
-              setFiles(prev => prev.map((f, i) => i === index ? { ...f, progress } : f));
-            },
-            err => {
-              setFiles(prev => prev.map((f, i) => i === index ? { ...f, error: err.message } : f));
-              resolve({ ...entry, error: err.message });
-            },
-            async () => {
-              const url = await getDownloadURL(task.snapshot.ref);
-              setFiles(prev => prev.map((f, i) => i === index ? { ...f, url, storagePath: path, progress: 100 } : f));
-              resolve({ ...entry, url, storagePath: path, progress: 100 });
-            }
-          );
-        });
-      })
-    );
+
+    // Use Firebase SDK resumable uploads for better performance + reliable progress events
+    const performResumableUpload = async (file, path, index) => {
+      const refObj = storageRef(storage, path);
+      const uploadTask = uploadBytesResumable(refObj, file, {
+        contentType: file.type || undefined,
+      });
+
+      await new Promise((resolve, reject) => {
+        uploadTask.on(
+          "state_changed",
+          (snap) => {
+            const progress = snap.totalBytes ? Math.round((snap.bytesTransferred / snap.totalBytes) * 100) : 0;
+            setFiles(prev => prev.map((f, idx) => idx === index ? { ...f, progress } : f));
+          },
+          (err) => {
+            reject(err);
+          },
+          () => resolve()
+        );
+      });
+
+      const url = await getDownloadURL(refObj);
+      return { url, storagePath: path };
+    };
+
+    const finalResults = [];
+    for (let i = 0; i < files.length; i++) {
+      const entry = files[i];
+      if (entry.url) {
+        finalResults.push(entry);
+        continue;
+      }
+
+      try {
+        const path = `task_submissions/${taskId}/${userId}/${Date.now()}_${entry.name}`;
+        const { url, storagePath } = await performResumableUpload(entry.file, path, i);
+        const successEntry = { ...entry, url, storagePath, progress: 100 };
+        setFiles(prev => prev.map((f, idx) => idx === i ? successEntry : f));
+        finalResults.push(successEntry);
+      } catch (err) {
+        const msg = err?.message || "Upload failed. Please try again.";
+        notify(msg, "error");
+        setFiles(prev => prev.map((f, idx) => idx === i ? { ...f, error: msg } : f));
+        finalResults.push({ ...entry, error: msg });
+      }
+    }
+
     setUploading(false);
-    return results.filter(f => f.url).map(f => ({ name: f.name, url: f.url, size: f.size, type: f.type, storagePath: f.storagePath }));
+    return finalResults.filter(f => f.url).map(f => ({ name: f.name, url: f.url, size: f.size, type: f.type, storagePath: f.storagePath }));
   }, [files, userId, taskId]);
 
   return { files, addFiles, removeFile, uploadAll, uploading, setFiles };
@@ -509,12 +569,18 @@ function FilePreview({ files }) {
         <div key={i} className="preview-item">
           <div className="preview-label">{f.name}</div>
           {f.type === "video" ? (
-            <video controls className="video-player">
+            <video controls playsInline preload="metadata" className="video-player">
               <source src={f.url} />
               Your browser does not support the video tag.
             </video>
           ) : f.type === "document" && f.name.toLowerCase().endsWith(".pdf") ? (
             <iframe src={`${f.url}#toolbar=0`} className="doc-viewer" title={f.name} />
+          ) : f.type === "document" && /\.(doc|docx|ppt|pptx|xls|xlsx)$/i.test(f.name || "") ? (
+            <iframe
+              src={`https://docs.google.com/gview?embedded=1&url=${encodeURIComponent(f.url)}`}
+              className="doc-viewer"
+              title={f.name}
+            />
           ) : f.type === "image" ? (
             <img src={f.url} alt={f.name} className="img-preview" />
           ) : (
@@ -1915,6 +1981,7 @@ function CSS() {
     .modal-overlay { position: fixed; inset: 0; background: rgba(20,32,51,.5); z-index: 999; display: flex; align-items: center; justify-content: center; padding: 24px; }
     .modal { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; width: 520px; max-height: 90vh; display: flex; flex-direction: column; overflow: hidden; box-shadow: 0 24px 60px rgba(0,0,0,0.2); }
     .modal.modal-wide { width: 740px; }
+    .modal.modal-centered { width: 560px; }
     .modal-header { padding: 22px 24px 0; display: flex; justify-content: space-between; align-items: flex-start; border-bottom: 1px solid var(--border); padding-bottom: 16px; }
     .modal-header h3 { font-size: 20px; font-weight: 800; color: var(--text); }
     .modal-sub { font-size: 13px; color: var(--muted); margin-top: 3px; }
@@ -1922,6 +1989,7 @@ function CSS() {
     .modal-body.scrollable { overflow-y: auto; max-height: calc(90vh - 130px); }
     .modal-footer { padding: 14px 24px; border-top: 1px solid var(--border); display: flex; gap: 10px; justify-content: flex-end; }
     .close-btn { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 20px; line-height: 1; padding: 4px; }
+    .center-msg { background: rgba(255,241,240,0.7); border: 1px solid rgba(180,35,24,0.25); color: #7f1d1d; border-radius: 12px; padding: 14px 16px; font-weight: 700; line-height: 1.6; }
 
     /* Scoring */
     .score-input-row { display: flex; flex-direction: column; gap: 6px; }
