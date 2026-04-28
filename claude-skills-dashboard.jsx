@@ -2004,6 +2004,9 @@ function CSS() {
 
     .auth-link { text-align: center; font-size: 13px; color: var(--muted); }
     .auth-link button { background: none; border: none; color: var(--accent); cursor: pointer; font-family: 'Source Sans 3', sans-serif; font-weight: 800; }
+    .link-btn { background: none; border: none; padding: 0; color: var(--accent); cursor: pointer; font-family: 'Source Sans 3', sans-serif; font-weight: 800; font-size: 13px; }
+    .link-btn:hover { text-decoration: underline; }
+    .link-btn:disabled { opacity: .6; cursor: not-allowed; text-decoration: none; }
     .back-btn { background: none; border: none; color: var(--accent); cursor: pointer; font-size: 14px; font-weight: 800; align-self: flex-start; font-family: 'Source Sans 3', sans-serif; }
     .auth-note, .setup-box { background: var(--bg); border: 1px solid var(--border); border-radius: 12px; padding: 14px; color: var(--muted); font-size: 13px; line-height: 1.7; }
     .setup-box { display: flex; flex-direction: column; gap: 6px; }
