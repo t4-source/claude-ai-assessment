@@ -682,7 +682,7 @@ function FilePreview({ files }) {
 }
 
 function ResolvedFileViewer({ file }) {
-  const [url, setUrl] = useState(file?.url || null);
+  const [url, setUrl] = useState(file?.objectKey ? null : (file?.url || null));
   const [error, setError] = useState(null);
 
   useEffect(() => {
@@ -692,7 +692,7 @@ function ResolvedFileViewer({ file }) {
     // If we already have a full URL (e.g. old Firebase storage or already resolved), use it.
     if (file?.url && /^https?:/i.test(file.url)) {
       setUrl(file.url);
-      return;
+      return () => { mounted = false; };
     }
 
     // R2 objects: resolve signed URL at view-time.
@@ -701,7 +701,7 @@ function ResolvedFileViewer({ file }) {
       getR2SignedViewUrl(file.objectKey)
         .then(u => { if (mounted) setUrl(u); })
         .catch(e => { if (mounted) setError(e?.message || "Could not load file"); });
-      return;
+      return () => { mounted = false; };
     }
 
     // Fallback to whatever was stored
