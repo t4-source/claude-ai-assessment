@@ -682,12 +682,27 @@ function FilePreview({ files }) {
 }
 
 function ResolvedFileViewer({ file }) {
-  const [url, setUrl] = useState(file?.objectKey ? null : (file?.url || null));
+  const startsWithR2Proxy = typeof file?.url === "string" && file.url.startsWith("/api/r2-file?key=");
+  const [url, setUrl] = useState((file?.objectKey || startsWithR2Proxy) ? null : (file?.url || null));
   const [error, setError] = useState(null);
 
   useEffect(() => {
     let mounted = true;
     setError(null);
+
+    if (typeof file?.url === "string" && file.url.startsWith("/api/r2-file?key=")) {
+      try {
+        const key = new URL(file.url, window.location.origin).searchParams.get("key");
+        if (!key) throw new Error("Could not load file");
+        setUrl(null);
+        getR2SignedViewUrl(key)
+          .then(u => { if (mounted) setUrl(u); })
+          .catch(e => { if (mounted) setError(e?.message || "Could not load file"); });
+      } catch {
+        setError("Could not load file");
+      }
+      return () => { mounted = false; };
+    }
 
     // If we already have a full URL (e.g. old Firebase storage or already resolved), use it.
     if (file?.url && /^https?:/i.test(file.url)) {
