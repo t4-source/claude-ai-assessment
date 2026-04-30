@@ -95,6 +95,16 @@ function getIsoDate(value) {
   return "";
 }
 
+function formatDDMMYYYY(value) {
+  if (!value) return "";
+  const d = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(d.valueOf())) return "";
+  const dd = String(d.getDate()).padStart(2, "0");
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const yyyy = String(d.getFullYear());
+  return `${dd}/${mm}/${yyyy}`;
+}
+
 function getSkillLevel(totalScore, maxScore = 40) {
   const max = Number(maxScore);
   if (!Number.isFinite(max) || max <= 0) return "Pending";
@@ -1280,13 +1290,12 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
   const skillDist = { Beginner: 0, Intermediate: 0, Advanced: 0, Pending: 0 };
   allSubs.forEach(s => { if (s.skillLevel in skillDist) skillDist[s.skillLevel]++; });
 
-  const exportAllScoresCSV = () => {
-    if (!allSubs.length) return;
-    const headers = ["Submitted At", "Task", "Candidate", "Email", "Status", "Skill Level", "Score"];
+  const exportAllScoresCSV = async () => {
+    const allSubs = db.taskSubmissions;
     const rows = allSubs.map(s => {
       const user = db.users.find(u => u.id === s.userId);
       const task = db.tasks.find(t => t.id === s.taskId);
-      const submittedAt = s.submittedAt ? new Date(s.submittedAt).toISOString() : (s.submittedAtIso || "");
+      const submittedAt = s.submittedAt ? formatDDMMYYYY(s.submittedAt) : formatDDMMYYYY(s.submittedAtIso || "");
       const status = s.evaluationSource === "pending" ? "Pending" : "Scored";
       const score = s.evaluationSource === "pending" ? "" : String(s.totalScore ?? "");
       const email = user?.email || "";
@@ -1473,7 +1482,7 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
                     <div className="rank-num">#{i+1}</div>
                     <div className="candidate-info">
                       <div className="candidate-name">{user?.name || "Unknown"}</div>
-                      <div className="candidate-meta">{task?.title || "Task"} • {new Date(s.submittedAt).toLocaleDateString()}</div>
+                      <div className="candidate-meta">{task?.title || "Task"} • {formatDDMMYYYY(s.submittedAt)}</div>
                     </div>
                     <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                       {s.files?.map((f, fi) => (
@@ -1618,7 +1627,7 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
                     return (
                       <div key={task.id} className="task-admin-row">
                         <div className="task-admin-title">{task.title}</div>
-                        <div className="muted">{deadline ? deadline.toLocaleString() : "N/A"}</div>
+                        <div className="muted">{deadline ? formatDDMMYYYY(deadline) : "N/A"}</div>
                         <div className={`task-status-pill ${task.active ? (expired ? "expired" : "active") : "inactive"}`}>
                           {task.active ? (expired ? "Expired" : "Active") : "Inactive"}
                         </div>
@@ -1830,11 +1839,11 @@ function SubmissionDetailModal({ submission, user, task, onClose, onScore, onNav
         <div className="modal-header">
           <div>
             <h3>{user?.name}'s Submission</h3>
-            <div className="modal-sub">{task?.title} • {submission.submittedAt ? new Date(submission.submittedAt).toLocaleString() : ""}</div>
+            <div className="modal-sub">{task?.title} • {formatDDMMYYYY(submission.submittedAt)}</div>
           </div>
           <div style={{ display:"flex", gap:8 }}>
             <button className="btn-primary sm" onClick={onScore}>
-              {submission.evaluationSource === "pending" ? "Score" : "Re-score"}
+              Score
             </button>
             <button className="close-btn" onClick={onClose}>✕</button>
           </div>
