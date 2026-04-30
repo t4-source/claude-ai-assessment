@@ -1244,6 +1244,7 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
   const [scoringModal, setScoringModal] = useState(null);   // task_submission doc
   const [detailModal, setDetailModal] = useState(null);     // task_submission doc
   const [taskViewer, setTaskViewer] = useState(null);       // task doc
+  const [deadlineModal, setDeadlineModal] = useState(null); // { task, value, saving }
   const [lbTaskId, setLbTaskId] = useState("");
 
   const candidates = db.users.filter(u => u.role === "candidate");
@@ -1624,6 +1625,17 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
                         <div style={{ textAlign:"right", fontFamily:"'IBM Plex Mono',monospace" }}>{subCount}</div>
                         <div style={{ textAlign:"right", display:"flex", gap: 8, justifyContent:"flex-end", flexWrap:"wrap" }}>
                           <button className="btn-outline sm" onClick={() => setTaskViewer(task)}>View</button>
+                          <button className="btn-outline sm" onClick={() => {
+                            const d = task.deadline ? new Date(task.deadline) : null;
+                            const pad = n => String(n).padStart(2, "0");
+                            const toLocalInput = (date) => {
+                              const dt = new Date(date);
+                              return `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}T${pad(dt.getHours())}:${pad(dt.getMinutes())}`;
+                            };
+                            setDeadlineModal({ task, value: d ? toLocalInput(d) : "", saving: false });
+                          }}>
+                            Extend deadline
+                          </button>
                           <button className="btn-outline sm" onClick={async () => {
                             try {
                               await updateDoc(doc(firestore, "tasks", task.id), { active: !task.active });
@@ -1653,6 +1665,54 @@ function AdminDashboard({ db, currentUser, logout, notify }) {
                 </div>
               )}
             </div>
+
+            {deadlineModal && (
+              <div className="modal-overlay" onClick={() => !deadlineModal.saving && setDeadlineModal(null)}>
+                <div className="modal" onClick={e => e.stopPropagation()}>
+                  <div className="modal-header">
+                    <div>
+                      <h3>Extend deadline</h3>
+                      <div className="modal-sub">{deadlineModal.task?.title}</div>
+                    </div>
+                    <button className="close-btn" onClick={() => !deadlineModal.saving && setDeadlineModal(null)}>✕</button>
+                  </div>
+                  <div className="modal-body">
+                    <div className="form-group">
+                      <label>New deadline</label>
+                      <input
+                        className="form-input"
+                        type="datetime-local"
+                        value={deadlineModal.value}
+                        onChange={e => setDeadlineModal(m => ({ ...m, value: e.target.value }))}
+                        disabled={deadlineModal.saving}
+                      />
+                    </div>
+                  </div>
+                  <div className="modal-footer">
+                    <button className="btn-outline" onClick={() => !deadlineModal.saving && setDeadlineModal(null)} disabled={deadlineModal.saving}>
+                      Cancel
+                    </button>
+                    <button className="btn-primary" onClick={async () => {
+                      if (!deadlineModal?.task?.id) return;
+                      if (!deadlineModal.value) return notify("Please select a new deadline.", "error");
+                      const dt = new Date(deadlineModal.value);
+                      if (Number.isNaN(dt.valueOf())) return notify("Invalid date/time.", "error");
+                      setDeadlineModal(m => ({ ...m, saving: true }));
+                      try {
+                        await updateDoc(doc(firestore, "tasks", deadlineModal.task.id), { deadline: dt });
+                        notify("Deadline updated.");
+                        setDeadlineModal(null);
+                      } catch (err) {
+                        notify(err.message || "Could not update deadline.", "error");
+                        setDeadlineModal(m => ({ ...m, saving: false }));
+                      }
+                    }} disabled={deadlineModal.saving}>
+                      {deadlineModal.saving ? "Saving…" : "Save"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
           </>
         )}
       </div>
